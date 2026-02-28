@@ -46,6 +46,62 @@ python3 e1m1_transformer_backend.py --move-delta 3.6 --strafe-delta 3.6 --turn-d
 python3 e1m1_transformer_backend.py --doom-ticrate 16 --doom-skill 1
 ```
 
+## Transformer Backend Details
+
+### 1. How the Transformer is used in the backend
+
+- The Transformer runs every tick on a temporal state window (`context=32`) and outputs:
+  - `state_out` (predicted next backend state vector).
+  - `control_logits` (decoded into Doom control actions).
+- The player action sent to Doom is computed from Transformer logits each tick (keyboard-gated, NN-modulated strength/conflict resolution).
+- Doom remains authoritative for world simulation and rendering (physics, collisions, enemy AI, damage, doors/triggers, pickups, map logic, graphics).
+
+### 2. Exact architecture and its parameters
+
+- Model: `HardcodedStateTransformer`.
+- Input projection: `Linear(state_dim -> 256)`.
+- Transformer core: 4 x `TransformerBlockWithAttention`, each block has:
+  - `MultiheadAttention(embed_dim=256, num_heads=8, dropout=0.0, batch_first=True)`.
+  - Feed-forward: `Linear(256 -> 512)`, `GELU`, `Linear(512 -> 256)`.
+  - Residual + `LayerNorm(256)` after attention and FFN.
+- Output heads:
+  - `state_out_proj`: `Linear(256 -> state_dim)`.
+  - `control_out_proj`: `Linear(256 -> 6)`.
+- Context length: `32`.
+- Training: none. Weights are deterministic hardcoded at startup and frozen (`requires_grad=False`).
+
+### 3. Number of parameters
+
+- Default runtime (`1024x768`, `frame_pool=16`):
+  - `state_dim = 3214`.
+  - Total parameters: `3,758,996`.
+  - Trainable parameters: `0`.
+- At `1280x960` with `frame_pool=16`:
+  - `state_dim = 4942`.
+  - Total parameters: `4,645,460`.
+
+### 4. Input features
+
+Per tick, one `state_in` vector is built and then stacked over time (`context=32`):
+
+- Doom game variables: `132` values (`GameVariable` enum entries).
+- Pooled frame features: grayscale average-pooled image, flattened.
+  - For `1024x768` with `frame_pool=16`: `3072` values (`64 x 48`).
+  - For `1280x960` with `frame_pool=16`: `4800` values (`80 x 60`).
+- Keyboard features: `10` values:
+  - forward, backward, strafe-left, strafe-right, turn-left, turn-right, look-up, look-down, attack, use.
+
+### 5. Input feature description
+
+- Game-variable features carry backend state (examples: health, armor, position, ammo, kills, etc.).
+- Frame features carry compact visual context from Doom screen buffer:
+  - RGB frame -> grayscale mean.
+  - Spatial average pooling with `frame_pool`.
+  - Flattened and normalized to `[0,1]`.
+- Keyboard features carry immediate control intent sampled each tick.
+- Final feature vector is stabilized by `tanh(vector / 100.0)` before entering the Transformer.
+- Tensor shape fed into the model each step: `[batch=1, context=32, state_dim]`.
+
 ## Important behavior
 
 - Gameplay and visuals are rendered by **VizDoom + your `DOOM.WAD`**, which preserves original E1M1 content and interactions.
