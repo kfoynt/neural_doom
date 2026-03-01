@@ -65,8 +65,9 @@ python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-
 - The player action sent to Doom is computed from Transformer logits each tick (keyboard-gated, NN-modulated strength/conflict resolution).
 - In `--enemy-backend-transformer` mode, the loop also sends per-slot enemy commands to a custom mod (`enemy_nn_backend_mod.pk3`) each tick:
   - Transformer behavior channels are decoded into backend actuation:
-    - behavior channels: core control channels (`speed_drive`, `fwd_drive`, `side_drive`, `turn_drive`, `aim_enable_logit`, `fire_pulse_logit`, `desired_range`, `commit_fire`, `disengage`, `target_offset`, `pressure`, `flank_bias`, `cooldown_ticks_intent`, `burst_ticks_intent`, `fire_threshold_intent`, `desired_aim_offset`, `aim_smoothing`, `track_aggressiveness`, `health_intent`) plus target-selection logits (`target_player_logit`, `target_slot_00_logit` ... `target_slot_15_logit`)
+    - behavior channels: core control channels (`speed_drive`, `fwd_drive`, `side_drive`, `turn_drive`, `aim_enable_logit`, `fire_pulse_logit`, `cooldown_ticks_intent`, `burst_ticks_intent`, `fire_threshold_intent`, `health_intent`) plus target-selection logits (`target_player_logit`, `target_slot_00_logit` ... `target_slot_15_logit`)
     - per-slot target logits are used each tick to select the enemy target point (player or another tracked slot)
+    - movement/pathing is now direct from NN channels: `speed_drive -> speed`, `fwd_drive -> fwd`, `side_drive -> side`, `turn_drive -> turn` (no range/pressure/disengage/flank blending in decoder)
     - actuation channels sent to Doom/mod: `speed`, `fwd`, `side`, `turn`, `aim`, `fire`
   - aiming/firing are direct from enemy outputs:
     - `aim_enable_logit` -> backend `aim` flag
@@ -74,6 +75,7 @@ python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-
     - `cooldown_ticks_intent` + `burst_ticks_intent` -> backend fire cadence (`nn_enemy_cmd_*_firecd`, burst length)
   - enemy health (`nn_enemy_cmd_*_healthpct`) is now driven from enemy behavior channel `health_intent`
   - low-level channels keep a firecd proxy for diagnostics only
+- Per-enemy memory state is maintained in-loop as a persistent latent (`8` values/slot), updated each tick from decoded enemy actuation, and fed back into `state_in`.
 - Doom remains authoritative for rendering and core simulation (physics, collisions, damage, doors/triggers, pickups, map logic).
 
 ### 2. Exact architecture and its parameters
@@ -87,7 +89,7 @@ python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-
 - Output heads:
   - `state_out_proj`: `Linear(256 -> state_dim)`.
   - `control_out_proj`: `Linear(256 -> 6)`.
-  - `enemy_out_proj`: `Linear(256 -> enemy_slots * enemy_cmd_dim)` (default `16 * 36`; 19 core channels + 17 target logits per slot).
+  - `enemy_out_proj`: `Linear(256 -> enemy_slots * enemy_cmd_dim)` (default `16 * 27`; 10 core channels + 17 target logits per slot).
   - `low_level_out_proj`: `Linear(256 -> low_level_dim)` where `low_level_dim = 4 + enemy_slots * 1` (default `20`).
 - Context length: `32`.
 - Training: none. Weights are deterministic hardcoded at startup and frozen (`requires_grad=False`).
@@ -95,12 +97,12 @@ python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-
 ### 3. Number of parameters
 
 - Default runtime (`1024x768`, `frame_pool=16`):
-  - `state_dim = 3566`.
-  - Total parameters: `4,092,744`.
+  - `state_dim = 3694`.
+  - Total parameters: `4,121,400`.
   - Trainable parameters: `0`.
 - At `1280x960` with `frame_pool=16`:
-  - `state_dim = 5294`.
-  - Total parameters: `4,979,208`.
+  - `state_dim = 5422`.
+  - Total parameters: `5,007,864`.
 
 ### 4. Input features
 
@@ -112,9 +114,10 @@ Per tick, one `state_in` vector is built and then stacked over time (`context=32
   - For `1280x960` with `frame_pool=16`: `4800` values (`80 x 60`).
 - Keyboard features: `10` values:
   - forward, backward, strafe-left, strafe-right, turn-left, turn-right, look-up, look-down, attack, use.
-- Enemy slot features: `enemy_slots * 22` values (default `16 * 22 = 352`), with stable ID->slot tracking:
+- Enemy slot features: `enemy_slots * 30` values (default `16 * 30 = 480`), with stable ID->slot tracking:
   - Base features (`11`/slot): alive flag, relative x/y, velocity x/y, facing angle, health proxy, distance to player, bearing to player, line-of-sight flag, cooldown proxy.
   - Feedback features (`11`/slot): last command (`speed/fwd/side/turn/aim/fire`) and observed response (`moved_dist`, `turn_delta`, `LOS_changed`, `blocked`, `shot_fired`).
+  - Memory features (`8`/slot): persistent EMA latent over enemy actuation (`fwd`, `side`, `turn`, `speed`, `aim`, `fire`, selected target index, cadence bias).
 
 ### 5. Input feature description
 
