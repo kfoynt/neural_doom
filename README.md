@@ -33,17 +33,24 @@ python3 e1m1_transformer_backend.py --keyboard-source macos_global
 # Permission-free keyboard capture via dedicated control window
 python3 e1m1_transformer_backend.py --keyboard-source pygame_window
 
-# Attention diagnostics panel on the right (toggle with F3)
-python3 e1m1_transformer_backend.py --keyboard-source pygame_window --diagnostic-panel-width 460
-
 # Faster movement/turning
 python3 e1m1_transformer_backend.py --action-repeat 5
+
+# Disable Transformer-side movement/collision resolver (fallback to native Doom movement)
+python3 e1m1_transformer_backend.py --disable-nn-movement-resolution
 
 # Fine-tune movement and firing cadence
 python3 e1m1_transformer_backend.py --move-delta 3.6 --strafe-delta 3.6 --turn-delta 1.35 --fire-cooldown-tics 8
 
+# Tighten NN outputs (more stable control)
+python3 e1m1_transformer_backend.py --nn-weight-scale 0.55 --nn-control-gain 1.00 --nn-enemy-gain 0.75 --nn-low-level-gain 0.45
+
 # Slow enemies/world pace
 python3 e1m1_transformer_backend.py --doom-ticrate 16 --doom-skill 1
+
+# Build and enable experimental Transformer enemy-backend override
+python3 build_enemy_nn_mod.py
+python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-mod enemy_nn_backend_mod.pk3 --enemy-slots 16
 ```
 
 ## Transformer Backend Details
@@ -53,8 +60,16 @@ python3 e1m1_transformer_backend.py --doom-ticrate 16 --doom-skill 1
 - The Transformer runs every tick on a temporal state window (`context=32`) and outputs:
   - `state_out` (predicted next backend state vector).
   - `control_logits` (decoded into Doom control actions).
+  - `enemy_logits` (per-slot enemy backend command logits when enemy backend mode is enabled).
+  - `low_level_logits` (non-standard backend knobs for player dynamics and enemy low-level channels).
 - The player action sent to Doom is computed from Transformer logits each tick (keyboard-gated, NN-modulated strength/conflict resolution).
-- Doom remains authoritative for world simulation and rendering (physics, collisions, enemy AI, damage, doors/triggers, pickups, map logic, graphics).
+- In `--enemy-backend-transformer` mode, the loop also sends per-slot enemy commands to a custom mod (`enemy_nn_backend_mod.pk3`) each tick:
+  - Transformer behavior channels are decoded into backend actuation:
+    - behavior channels: `speed_drive`, `fwd_drive`, `side_drive`, `turn_drive`, `aim_drive`, `fire_drive`, `desired_range`, `commit_fire`, `disengage`, `target_offset`, `pressure`, `flank_bias`, `fire_rate`, `burst_len`, `cooldown_intent`, `desired_aim_offset`, `aim_smoothing`, `track_aggressiveness`
+    - actuation channels sent to Doom/mod: `speed`, `fwd`, `side`, `turn`, `aim`, `fire`
+  - fire cadence (`nn_enemy_cmd_*_firecd`) is now driven from enemy behavior channels (`fire_rate`, `burst_len`, `cooldown_intent`)
+  - low-level channels still provide `healthpct` (and a firecd proxy used for diagnostics only)
+- Doom remains authoritative for rendering and core simulation (physics, collisions, damage, doors/triggers, pickups, map logic).
 
 ### 2. Exact architecture and its parameters
 
@@ -67,18 +82,20 @@ python3 e1m1_transformer_backend.py --doom-ticrate 16 --doom-skill 1
 - Output heads:
   - `state_out_proj`: `Linear(256 -> state_dim)`.
   - `control_out_proj`: `Linear(256 -> 6)`.
+  - `enemy_out_proj`: `Linear(256 -> enemy_slots * enemy_cmd_dim)` (default `16 * 18`).
+  - `low_level_out_proj`: `Linear(256 -> low_level_dim)` where `low_level_dim = 4 + enemy_slots * 2` (default `36`).
 - Context length: `32`.
 - Training: none. Weights are deterministic hardcoded at startup and frozen (`requires_grad=False`).
 
 ### 3. Number of parameters
 
 - Default runtime (`1024x768`, `frame_pool=16`):
-  - `state_dim = 3214`.
-  - Total parameters: `3,758,996`.
+  - `state_dim = 3566`.
+  - Total parameters: `4,022,840`.
   - Trainable parameters: `0`.
 - At `1280x960` with `frame_pool=16`:
-  - `state_dim = 4942`.
-  - Total parameters: `4,645,460`.
+  - `state_dim = 5294`.
+  - Total parameters: `4,909,304`.
 
 ### 4. Input features
 
@@ -90,6 +107,9 @@ Per tick, one `state_in` vector is built and then stacked over time (`context=32
   - For `1280x960` with `frame_pool=16`: `4800` values (`80 x 60`).
 - Keyboard features: `10` values:
   - forward, backward, strafe-left, strafe-right, turn-left, turn-right, look-up, look-down, attack, use.
+- Enemy slot features: `enemy_slots * 22` values (default `16 * 22 = 352`), with stable ID->slot tracking:
+  - Base features (`11`/slot): alive flag, relative x/y, velocity x/y, facing angle, health proxy, distance to player, bearing to player, line-of-sight flag, cooldown proxy.
+  - Feedback features (`11`/slot): last command (`speed/fwd/side/turn/aim/fire`) and observed response (`moved_dist`, `turn_delta`, `LOS_changed`, `blocked`, `shot_fired`).
 
 ### 5. Input feature description
 
@@ -109,15 +129,17 @@ Per tick, one `state_in` vector is built and then stacked over time (`context=32
 - Keyboard input is read each tick and fed into Transformer control decoding (`W/S/A/D`, arrows, fire/use).
 - Startup enforces key binds: `W/S/A/D`, `Left/Right/Up/Down`, `Space` (attack), `E` (use). (`Z/Q` are also accepted for AZERTY layouts).
 - Startup writes and loads `transformer_controls.cfg` to force this keymap every run.
+- Movement/collision resolver can run inside the Transformer loop (`--nn-movement-resolution`, enabled by default):
+  - Loads blocking linedefs from `DOOM.WAD` (current map).
+  - Resolves player movement with wall/entity collision checks in Python.
+  - Applies resolved position via `warp` each tic.
+  - Enemy movement commands are also pre-resolved against the same collision map before being sent to the backend mod.
 - On macOS visible runs, the script merges Doom button states with global key-state sampling (ApplicationServices) for more reliable key detection.
 - On macOS, letter-key capture requires OS permissions. If `keys=[]` while pressing letters, enable:
   - `System Settings -> Privacy & Security -> Accessibility`
   - `System Settings -> Privacy & Security -> Input Monitoring`
 - In `auto` mode (visible run), the script now prefers `pygame_window` first for strict key-up/key-down behavior and less sticky-input risk.
 - `pygame_window` mode is now a single focused game window (`Transformer Doom (focus this window)`): it renders Doom frames and captures keyboard input in the same window.
-- In `pygame_window` mode, a right-side diagnostics panel visualizes Transformer internals in real time.
-- Diagnostics controls: `F3` hide/show panel, `F4` toggle `mean` vs `single-head` view, `F5/F6` change head index.
-- Diagnostics also show `dL0..dL3` (mean absolute attention change per layer). Values above `0` confirm live matrix updates.
 - Strict keyboard gating for sampled keys: when no key is sampled, the loop avoids injecting movement/fire/use actions.
 - Control actions are now re-sampled every Doom tic (even when `--action-repeat > 1`) to reduce sticky movement on key release.
 - `--action-repeat` controls movement/turn speed by applying each decoded action for multiple VizDoom ticks (default `5`).
@@ -128,6 +150,10 @@ Per tick, one `state_in` vector is built and then stacked over time (`context=32
 - The Transformer predicts both:
   - `state_out` (next state vector)
   - control logits (decoded to Doom buttons)
-- The diagnostics panel shows per-layer attention matrices. In `single-head` mode you see an actual head matrix (`Lx head h`), and in `mean` mode you see head-averaged attention. Each matrix cell encodes query-time (row) attending to key-time (column) within the context window; blue means lower attention and red means higher attention.
+  - enemy logits (decoded to per-slot enemy backend movement/aim/fire + cadence commands when enabled)
+  - low-level logits (decoded to non-standard player dynamics + enemy health channel)
 - Player control is keyboard-gated but now NN-modulated each tick: control logits scale movement/turn strength, and still resolve opposing-key conflicts.
-- Doom remains authoritative for world logic (physics/collisions/doors/triggers/AI/damage/pickups), preserving full E1M1 functionality and original graphics.
+- Experimental enemy-backend mode:
+  - Build mod with `python3 build_enemy_nn_mod.py`.
+  - Enable with `--enemy-backend-transformer --enemy-backend-mod enemy_nn_backend_mod.pk3`.
+  - Current mod implementation applies per-slot monster movement/pathing, aiming, and firing control commands from Transformer outputs.
