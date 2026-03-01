@@ -1,7 +1,6 @@
 class NNEnemyBackendHandler : EventHandler
 {
     static const int MAX_SLOTS = 16;
-    int fireCooldown[MAX_SLOTS];
 
     private Actor FindAnyPlayer()
     {
@@ -39,6 +38,13 @@ class NNEnemyBackendHandler : EventHandler
         return x;
     }
 
+    private double Phase01(int salt)
+    {
+        // Stateless deterministic phase signal for continuous decode.
+        int t = (level.time + salt) % 127;
+        return double(t) / 126.0;
+    }
+
     private void ApplyEnemySlotCommand(Actor mo, Actor player, int slot)
     {
         double presentNorm = Clamp(ReadSlotFloat(slot, "present_norm", 1.0), -1.0, 1.0);
@@ -52,31 +58,16 @@ class NNEnemyBackendHandler : EventHandler
         double healthNorm = Clamp(ReadSlotFloat(slot, "health_norm", 0.5), 0.0, 1.0);
         double targetNorm = Clamp(ReadSlotFloat(slot, "target_norm", 0.0), -1.0, 1.0);
 
-        int speedPct = int(30.0 + 220.0 * (0.5 + 0.5 * speedNorm));
-        int fwdPct = int(100.0 * fwdNorm);
-        int sidePct = int(100.0 * sideNorm);
-        int turnCmd = int(120.0 * turnNorm);
-        int aimCmd = (aimNorm > 0.0) ? 1 : 0;
-        int fireCmd = (fireNorm > 0.0) ? 1 : 0;
-        int fireCooldownCmd = int(1.0 + 34.0 * fireCdNorm);
-        int healthPct = int(20.0 + 280.0 * healthNorm);
+        double speedScale = Clamp(0.30 + 2.20 * (0.5 + 0.5 * speedNorm), 0.30, 2.50);
+        double fwd = Clamp(fwdNorm, -1.0, 1.0);
+        double side = Clamp(sideNorm, -1.0, 1.0);
+        double turnCmd = 120.0 * Clamp(turnNorm, -1.0, 1.0);
+        double aimDrive = Clamp(0.5 + 0.5 * aimNorm, 0.0, 1.0);
+        double fireDrive = Clamp(0.5 + 0.5 * fireNorm, 0.0, 1.0);
+        double cadenceDrive = Clamp(1.0 - fireCdNorm, 0.0, 1.0);
+        double targetDrive = Clamp(0.5 + 0.5 * targetNorm, 0.0, 1.0);
+        int healthPct = int(20.0 + 280.0 * Clamp(healthNorm, 0.0, 1.0));
 
-        if (speedPct < 30)
-        {
-            speedPct = 30;
-        }
-        if (speedPct > 250)
-        {
-            speedPct = 250;
-        }
-        if (fwdPct < -100) fwdPct = -100;
-        if (fwdPct > 100) fwdPct = 100;
-        if (sidePct < -100) sidePct = -100;
-        if (sidePct > 100) sidePct = 100;
-        if (turnCmd < -120) turnCmd = -120;
-        if (turnCmd > 120) turnCmd = 120;
-        if (fireCooldownCmd < 1) fireCooldownCmd = 1;
-        if (fireCooldownCmd > 35) fireCooldownCmd = 35;
         if (healthPct < 20) healthPct = 20;
         if (healthPct > 300) healthPct = 300;
 
@@ -102,7 +93,7 @@ class NNEnemyBackendHandler : EventHandler
             }
         }
 
-        mo.Speed = mo.Default.Speed * (double(speedPct) / 100.0);
+        mo.Speed = mo.Default.Speed * speedScale;
         mo.target = null;
         mo.threshold = 0;
 
@@ -114,14 +105,20 @@ class NNEnemyBackendHandler : EventHandler
         }
 
         mo.Angle += turnCmd;
-        if (aimCmd > 0 && targetNorm > -0.95 && player != null && player.health > 0)
+
+        bool playerValid = (player != null && player.health > 0);
+        if (playerValid)
         {
             mo.target = player;
+        }
+
+        // Continuous target policy: no binary target gate, targetDrive controls influence.
+        double aimMix = aimDrive * targetDrive;
+        if (playerValid && aimMix > Phase01(11 + slot * 13))
+        {
             mo.A_FaceTarget();
         }
 
-        double fwd = double(fwdPct) / 100.0;
-        double side = double(sidePct) / 100.0;
         double yaw = mo.Angle;
         double c = Cos(yaw);
         double s = Sin(yaw);
@@ -129,24 +126,15 @@ class NNEnemyBackendHandler : EventHandler
         mo.Vel.X = (c * fwd - s * side) * scale;
         mo.Vel.Y = (s * fwd + c * side) * scale;
 
-        if (fireCooldown[slot] > 0)
+        // Continuous fire decode: cadence and trigger strength come from model outputs.
+        // No rule-based cooldown counter is kept in the mod.
+        double fireMix = fireDrive * targetDrive * (0.08 + 0.92 * cadenceDrive);
+        if (playerValid && fireMix > Phase01(53 + slot * 17))
         {
-            fireCooldown[slot]--;
-        }
-        if (fireCmd > 0 && fireCooldown[slot] <= 0)
-        {
-            if (targetNorm > -0.95 && player != null && player.health > 0)
-            {
-                mo.target = player;
-            }
             bool launched = mo.SetStateLabel("Missile");
             if (!launched)
             {
                 launched = mo.SetStateLabel("Melee");
-            }
-            if (launched)
-            {
-                fireCooldown[slot] = fireCooldownCmd;
             }
         }
     }

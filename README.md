@@ -92,10 +92,14 @@ python3 run_enemy_regression.py --wad DOOM.WAD --enemy-backend-mod enemy_nn_back
     - final backend actuation is fully direct from final actuator channels with hard safety bounds only
     - actuation channels sent to Doom/mod are normalized float cvars: `speed_norm`, `fwd_norm`, `side_norm`, `turn_norm`, `aim_norm`, `fire_norm`, `firecd_norm`, `health_norm`, `target_norm`, `present_norm`
   - aiming/firing/timing are decoded directly from actuator channels (`act_aim_logit`, `act_fire_logit`, `act_firecd_norm`) and passed to the mod as normalized floats.
+  - mod-side fire timing now uses continuous model-driven decode (`fire_norm`, `firecd_norm`) without a rule-based cooldown counter.
+  - mod-side aim/fire no longer use binary `>0` threshold gates; continuous normalized drives are used with crash-safe bounds.
+  - target policy execution in the mod is driven continuously by `target_norm` (model output), rather than fixed player-target gating thresholds.
   - enemy health control is driven directly from `act_health_norm` (normalized float path).
   - enemy intent head (`chase/flank/retreat/hold` + timer) is currently emitted as model context/diagnostics (not in final actuator path)
 - Per-enemy memory state is maintained in-loop as a persistent latent (`10` values/slot), updated each tick only by Transformer memory-update outputs (gate + delta), and fed back into `state_in`.
   - explicit memory channels include `target_identity_norm` and `slot_presence_norm`; memory evolution is Transformer-only (gate + delta), with no Python-side memory writeback rules.
+  - slot assignment is memory-guided to improve identity continuity under frame-order permutations.
 - By default, Doom remains authoritative for rendering and core simulation (physics, collisions, damage, doors/triggers, pickups, map logic).
 - With `--nn-world-sim` (experimental), low-level movement/collision/combat are stepped in Transformer-side Python state and bridged back into Doom each tick (`warp`/`setangle` + enemy health sync).
 
@@ -138,9 +142,9 @@ Per tick, one `state_in` vector is built and then stacked over time (`context=32
   - For `1280x960` with `frame_pool=16`: `4800` values (`80 x 60`).
 - Keyboard features: `10` values:
   - forward, backward, strafe-left, strafe-right, turn-left, turn-right, look-up, look-down, attack, use.
-- Enemy slot features: `enemy_slots * 45` values (default `16 * 45 = 720`), in direct observed slot order:
-  - Base features (`24`/slot): mostly raw object/player state (enemy x/y/z, velocity x/y/z, angle, pitch, radius, height, health, mass, reaction, threshold, player x/y/angle/health, relative x/y, observed identity scalar).
-  - Feedback features (`11`/slot): last command (`speed/fwd/side/turn/aim/fire`) and raw frame deltas (`delta_x`, `delta_y`, `delta_angle`, `delta_health`, previous-observation flag).
+- Enemy slot features: `enemy_slots * 45` values (default `16 * 45 = 720`), with memory-guided slot alignment:
+  - Base features (`24`/slot): mostly raw object/player state (enemy x/y/z, velocity x/y/z, angle, pitch, radius, height, health, mass, reaction, threshold, player x/y/z/angle/health/velocity/pitch, observed identity scalar).
+  - Feedback features (`11`/slot): last command (`speed/fwd/side/turn/aim/fire`) and previous raw observations (`prev_x`, `prev_y`, `prev_angle`, `prev_health`, previous-observation flag).
 - Memory features (`10`/slot): persistent NN-updated latent channels (gate + delta), carried across ticks and fed back into `state_in`.
   - includes explicit `target_identity_norm` and `slot_presence_norm` channels for slot identity continuity.
 - Target-valid mask features: `1 + enemy_slots` values (default `17`) for model-facing target validity (`player + slot occupancy`).
@@ -191,7 +195,9 @@ Per tick, one `state_in` vector is built and then stacked over time (`context=32
 - Experimental enemy-backend mode:
   - Build mod with `python3 build_enemy_nn_mod.py`.
   - Enable with `--enemy-backend-transformer --enemy-backend-mod enemy_nn_backend_mod.pk3`.
-  - Current implementation applies per-slot monster movement/pathing/aiming/firing commands from Transformer outputs, with direct observed-slot feed, direct actuator decode, and normalized float command transfer into the backend mod.
+  - Current implementation applies per-slot monster movement/pathing/aiming/firing commands from Transformer outputs, with memory-guided slot alignment, direct actuator decode, and normalized float command transfer into the backend mod.
   - Python-side decode shaping is reduced to crash-safe bounds + command transport only (no Python target keep/blend logic and no Python fire-policy gating).
+  - Mod-side decode is continuous (no binary `aim/fire > 0` gates and no rule-based per-slot fire cooldown counters).
   - Headless runs print regression metrics summary (`shots_per_tick`, `target_switches`, `close_pairs_per_tick`, `identity_churn_rate`, `player_max_stuck_ticks`, `mse_mean`, `mse_drift`) at session end.
   - Release criteria are enforced by default in `run_enemy_regression.py` (maps `E1M1,E1M2,E1M3`, seeds `1,2,3`, tick suites `5000,20000`); use `--quick` only for local iteration.
+  - CI release-gate workflow: [`.github/workflows/enemy-regression-gate.yml`](.github/workflows/enemy-regression-gate.yml).
