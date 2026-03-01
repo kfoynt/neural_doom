@@ -555,6 +555,8 @@ class EmulationConfig:
     nn_control_gain: float
     nn_enemy_gain: float
     nn_low_level_gain: float
+    nn_world_sim: bool
+    nn_world_damage_scale: float
 
 
 class DoomTransformerLoop:
@@ -743,6 +745,14 @@ class DoomTransformerLoop:
         self._enemy_metric_target_switches = 0
         self._enemy_metric_active_enemy_ticks = 0
         self._enemy_metric_close_pairs = 0
+        self._world_sim_initialized = False
+        self._world_sim_tick = 0
+        self._world_player = np.zeros(4, dtype=np.float32)  # x, y, angle_deg, health
+        self._world_enemies = np.zeros((self.config.enemy_slots, 5), dtype=np.float32)  # x, y, angle_deg, health, alive
+        self._world_kills = 0
+        self._world_last_bridge_x = np.nan
+        self._world_last_bridge_y = np.nan
+        self._world_last_bridge_angle = np.nan
         self._latest_target_mask = np.zeros(self.enemy_target_mask_dim, dtype=np.float32)
         if self.enemy_target_mask_dim > 0:
             self._latest_target_mask[0] = 100.0
@@ -750,6 +760,9 @@ class DoomTransformerLoop:
         self._init_keyboard_source()
         if self._nn_movement_resolution_active and self._uses_doom_buttons_source():
             # doom_buttons requires native binds, which conflicts with Transformer-side movement warping.
+            self._nn_movement_resolution_active = False
+        if self.config.nn_world_sim:
+            # World sim owns player movement/collision; disable native NN movement resolver path.
             self._nn_movement_resolution_active = False
         self.game = self._init_game()
         self.state_dim = (
@@ -792,7 +805,7 @@ class DoomTransformerLoop:
                 print(f"Warning: NN movement resolution disabled ({exc}).")
             self._map_geometry = None
         self._collision_map: WADCollisionMap | None = (
-            self._map_geometry if self._nn_movement_resolution_active else None
+            self._map_geometry if (self._nn_movement_resolution_active or self.config.nn_world_sim) else None
         )
 
     def _uses_doom_buttons_source(self) -> bool:
@@ -884,6 +897,15 @@ class DoomTransformerLoop:
 
         if preferred == "doom_buttons":
             self.keyboard_source = "doom_buttons"
+            if self.config.nn_world_sim and self.config.visible:
+                try:
+                    self.pygame_keyboard_sampler = PygameKeyboardSampler(
+                        self.config.frame_width,
+                        self.config.frame_height,
+                    )
+                    self.keyboard_source = "pygame_window"
+                except Exception:
+                    pass
             return
 
         if preferred == "auto" and self.config.visible:
@@ -953,6 +975,15 @@ class DoomTransformerLoop:
                     except Exception:
                         pass
         self.keyboard_source = "doom_buttons"
+        if self.config.nn_world_sim and self.config.visible:
+            try:
+                self.pygame_keyboard_sampler = PygameKeyboardSampler(
+                    self.config.frame_width,
+                    self.config.frame_height,
+                )
+                self.keyboard_source = "pygame_window"
+            except Exception:
+                pass
 
     def _bind_keyboard_controls(self, game: DoomGame) -> None:
         if self._nn_movement_resolution_active and not self._uses_doom_buttons_source():
@@ -1483,15 +1514,31 @@ class DoomTransformerLoop:
 
         state = self.game.get_state()
         slot_enemies = self._refresh_enemy_slot_assignments(state)
-        player_x, player_y = self._current_position()
+        if self.config.nn_world_sim:
+            if not self._world_sim_initialized:
+                self._world_sim_bootstrap(slot_enemies)
+            else:
+                self._world_sim_sync_slots(slot_enemies)
+        if self.config.nn_world_sim and self._world_sim_initialized:
+            player_x = float(self._world_player[0])
+            player_y = float(self._world_player[1])
+        else:
+            player_x, player_y = self._current_position()
         commands: list[tuple[int, int, int, int, int, int]] = []
         shots_tick = 0
         target_switches_tick = 0
-        active_positions = [
-            (float(enemy.position_x), float(enemy.position_y))
-            for enemy in slot_enemies
-            if enemy is not None
-        ]
+        if self.config.nn_world_sim and self._world_sim_initialized:
+            active_positions = [
+                (float(self._world_enemies[slot, 0]), float(self._world_enemies[slot, 1]))
+                for slot in range(self.config.enemy_slots)
+                if self._world_enemies[slot, 4] > 0.5
+            ]
+        else:
+            active_positions = [
+                (float(enemy.position_x), float(enemy.position_y))
+                for enemy in slot_enemies
+                if enemy is not None
+            ]
         close_pairs_tick = 0
         for i in range(len(active_positions)):
             x1, y1 = active_positions[i]
@@ -1603,9 +1650,14 @@ class DoomTransformerLoop:
                 _ = (target_x, target_y, _target_index)
 
                 # Movement resolution comes from explicit actuator movement channels.
-                enemy_x = float(enemy.position_x)
-                enemy_y = float(enemy.position_y)
-                angle_rad = np.deg2rad(float(enemy.angle))
+                if self.config.nn_world_sim and self._world_sim_initialized:
+                    enemy_x = float(self._world_enemies[slot, 0])
+                    enemy_y = float(self._world_enemies[slot, 1])
+                    angle_rad = np.deg2rad(float(self._world_enemies[slot, 2]))
+                else:
+                    enemy_x = float(enemy.position_x)
+                    enemy_y = float(enemy.position_y)
+                    angle_rad = np.deg2rad(float(enemy.angle))
                 cos_a = float(np.cos(angle_rad))
                 sin_a = float(np.sin(angle_rad))
                 move_local_fwd = float(cos_a * act_move_dx_cmd + sin_a * act_move_dy_cmd)
@@ -1724,6 +1776,226 @@ class DoomTransformerLoop:
         self._enemy_metric_target_switches += target_switches_tick
         self._enemy_metric_close_pairs += close_pairs_tick
         return enemy_count, commands
+
+    def _wrap_angle_deg(self, angle_deg: float) -> float:
+        return float((angle_deg + 180.0) % 360.0 - 180.0)
+
+    def _world_sim_bootstrap(self, slot_enemies: list[object | None] | None = None) -> None:
+        if slot_enemies is None:
+            state = self.game.get_state()
+            slot_enemies = self._refresh_enemy_slot_assignments(state)
+        px, py = self._current_position()
+        pangle = float(self.game.get_game_variable(GameVariable.ANGLE))
+        self._world_player[0] = float(px)
+        self._world_player[1] = float(py)
+        self._world_player[2] = self._wrap_angle_deg(pangle)
+        self._world_player[3] = float(np.clip(self.game.get_game_variable(GameVariable.HEALTH), 0.0, 200.0))
+        self._world_enemies[:, :] = 0.0
+        for slot in range(self.config.enemy_slots):
+            enemy = slot_enemies[slot] if slot < len(slot_enemies) else None
+            if enemy is None:
+                continue
+            self._world_enemies[slot, 0] = float(enemy.position_x)
+            self._world_enemies[slot, 1] = float(enemy.position_y)
+            self._world_enemies[slot, 2] = self._wrap_angle_deg(float(enemy.angle))
+            self._world_enemies[slot, 3] = 100.0
+            self._world_enemies[slot, 4] = 1.0
+        self._world_kills = 0
+        self._world_sim_tick = 0
+        self._world_last_bridge_x = np.nan
+        self._world_last_bridge_y = np.nan
+        self._world_last_bridge_angle = np.nan
+        self._world_sim_initialized = True
+
+    def _world_sim_sync_slots(self, slot_enemies: list[object | None]) -> None:
+        for slot in range(self.config.enemy_slots):
+            enemy = slot_enemies[slot] if slot < len(slot_enemies) else None
+            if enemy is None:
+                continue
+            if self._world_enemies[slot, 4] <= 0.0:
+                self._world_enemies[slot, 0] = float(enemy.position_x)
+                self._world_enemies[slot, 1] = float(enemy.position_y)
+                self._world_enemies[slot, 2] = self._wrap_angle_deg(float(enemy.angle))
+                self._world_enemies[slot, 3] = 100.0
+                self._world_enemies[slot, 4] = 1.0
+
+    def _world_sim_step(
+        self,
+        player_action: list[float],
+        enemy_commands: list[tuple[int, int, int, int, int, int]],
+        sub_steps: int | None = None,
+    ) -> None:
+        if not self._world_sim_initialized:
+            self._world_sim_bootstrap()
+        sim_sub_steps = max(1, self.config.action_repeat if sub_steps is None else sub_steps)
+        for _ in range(sim_sub_steps):
+            # Player kinematics from decoded control action.
+            px = float(self._world_player[0])
+            py = float(self._world_player[1])
+            move_norm = float(
+                np.clip(float(player_action[0]) / max(0.1, self.config.move_delta), -1.0, 1.0)
+            )
+            strafe_norm = float(
+                np.clip(float(player_action[1]) / max(0.1, self.config.strafe_delta), -1.0, 1.0)
+            )
+            turn_norm = float(
+                np.clip(float(player_action[2]) / max(0.1, self.config.turn_delta), -1.0, 1.0)
+            )
+            pangle = self._wrap_angle_deg(float(self._world_player[2] + 5.0 * turn_norm))
+            self._world_player[2] = pangle
+            prad = np.deg2rad(pangle)
+            cos_a = float(np.cos(prad))
+            sin_a = float(np.sin(prad))
+            pdx = (cos_a * move_norm - sin_a * strafe_norm) * self.config.nn_move_units
+            pdy = (sin_a * move_norm + cos_a * strafe_norm) * self.config.nn_move_units
+            if self._collision_map is not None:
+                dyn = [
+                    (float(self._world_enemies[s, 0]), float(self._world_enemies[s, 1]), 20.0)
+                    for s in range(self.config.enemy_slots)
+                    if self._world_enemies[s, 4] > 0.5
+                ]
+                npx, npy = self._collision_map.resolve_motion(
+                    px,
+                    py,
+                    pdx,
+                    pdy,
+                    radius=self.config.nn_player_radius,
+                    dynamic_circles=dyn,
+                )
+                self._world_player[0] = float(npx)
+                self._world_player[1] = float(npy)
+            else:
+                self._world_player[0] = float(px + pdx)
+                self._world_player[1] = float(py + pdy)
+
+            # Enemy kinematics from actuator-resolved commands.
+            for slot in range(min(len(enemy_commands), self.config.enemy_slots)):
+                if self._world_enemies[slot, 4] <= 0.5:
+                    continue
+                speed, fwd, side, turn, aim, fire = enemy_commands[slot]
+                _ = (aim, fire)
+                ex = float(self._world_enemies[slot, 0])
+                ey = float(self._world_enemies[slot, 1])
+                eangle = self._wrap_angle_deg(float(self._world_enemies[slot, 2] + 0.35 * float(turn)))
+                self._world_enemies[slot, 2] = eangle
+                erad = np.deg2rad(eangle)
+                ecos = float(np.cos(erad))
+                esin = float(np.sin(erad))
+                speed_scale = float(np.clip(speed / 100.0, 0.35, 2.30))
+                edx = (ecos * (fwd / 100.0) - esin * (side / 100.0)) * (5.0 * speed_scale)
+                edy = (esin * (fwd / 100.0) + ecos * (side / 100.0)) * (5.0 * speed_scale)
+                if self._collision_map is not None:
+                    dyn: list[tuple[float, float, float]] = [
+                        (float(self._world_player[0]), float(self._world_player[1]), 16.0)
+                    ]
+                    for other in range(self.config.enemy_slots):
+                        if other == slot or self._world_enemies[other, 4] <= 0.5:
+                            continue
+                        dyn.append((float(self._world_enemies[other, 0]), float(self._world_enemies[other, 1]), 20.0))
+                    nex, ney = self._collision_map.resolve_motion(
+                        ex,
+                        ey,
+                        edx,
+                        edy,
+                        radius=20.0,
+                        dynamic_circles=dyn,
+                    )
+                    self._world_enemies[slot, 0] = float(nex)
+                    self._world_enemies[slot, 1] = float(ney)
+                else:
+                    self._world_enemies[slot, 0] = float(ex + edx)
+                    self._world_enemies[slot, 1] = float(ey + edy)
+
+            # Combat simulation: player -> enemies.
+            player_fire = bool(len(player_action) > 4 and player_action[4] > 0.5 and self._world_player[3] > 0.0)
+            if player_fire:
+                pangle = float(self._world_player[2])
+                px = float(self._world_player[0])
+                py = float(self._world_player[1])
+                best_slot = None
+                best_dist = 1e9
+                for slot in range(self.config.enemy_slots):
+                    if self._world_enemies[slot, 4] <= 0.5:
+                        continue
+                    dx = float(self._world_enemies[slot, 0] - px)
+                    dy = float(self._world_enemies[slot, 1] - py)
+                    dist = float(np.hypot(dx, dy))
+                    if dist > 900.0 or dist < 1e-4:
+                        continue
+                    bearing = float(np.degrees(np.arctan2(dy, dx)))
+                    err = abs(self._wrap_angle_deg(bearing - pangle))
+                    if err > 9.0:
+                        continue
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_slot = slot
+                if best_slot is not None:
+                    self._world_enemies[best_slot, 3] = float(
+                        max(0.0, self._world_enemies[best_slot, 3] - 22.0 * self.config.nn_world_damage_scale)
+                    )
+                    if self._world_enemies[best_slot, 3] <= 0.0 and self._world_enemies[best_slot, 4] > 0.5:
+                        self._world_enemies[best_slot, 4] = 0.0
+                        self._world_kills += 1
+
+            # Combat simulation: enemies -> player.
+            px = float(self._world_player[0])
+            py = float(self._world_player[1])
+            for slot in range(min(len(enemy_commands), self.config.enemy_slots)):
+                if self._world_enemies[slot, 4] <= 0.5:
+                    continue
+                _speed, _fwd, _side, _turn, aim, fire = enemy_commands[slot]
+                if not (aim == 1 and fire == 1):
+                    continue
+                ex = float(self._world_enemies[slot, 0])
+                ey = float(self._world_enemies[slot, 1])
+                eang = float(self._world_enemies[slot, 2])
+                dx = px - ex
+                dy = py - ey
+                dist = float(np.hypot(dx, dy))
+                if dist > 800.0 or dist < 1e-4:
+                    continue
+                bearing = float(np.degrees(np.arctan2(dy, dx)))
+                err = abs(self._wrap_angle_deg(bearing - eang))
+                if err > 14.0:
+                    continue
+                self._world_player[3] = float(max(0.0, self._world_player[3] - 5.0 * self.config.nn_world_damage_scale))
+
+            self._world_sim_tick += 1
+
+    def _world_sim_apply_render_bridge(self) -> None:
+        if not self._world_sim_initialized:
+            return
+        px = float(self._world_player[0])
+        py = float(self._world_player[1])
+        pang = float(self._world_player[2])
+        if (
+            np.isnan(self._world_last_bridge_x)
+            or np.isnan(self._world_last_bridge_y)
+            or np.isnan(self._world_last_bridge_angle)
+        ):
+            do_bridge = True
+        else:
+            do_bridge = (
+                abs(px - float(self._world_last_bridge_x)) > 0.08
+                or abs(py - float(self._world_last_bridge_y)) > 0.08
+                or abs(self._wrap_angle_deg(pang - float(self._world_last_bridge_angle))) > 0.20
+            )
+        if do_bridge:
+            self.game.send_game_command(f"warp {px:.3f} {py:.3f}")
+            self.game.send_game_command(f"setangle {pang:.3f}")
+            self._world_last_bridge_x = px
+            self._world_last_bridge_y = py
+            self._world_last_bridge_angle = pang
+        if not self.config.enemy_backend_transformer:
+            return
+        for slot in range(self.config.enemy_slots):
+            if self._world_enemies[slot, 4] > 0.5:
+                healthpct = int(np.clip(round(self._world_enemies[slot, 3]), 1, 200))
+            else:
+                healthpct = 0
+            if healthpct != self._last_enemy_cmds[slot]["healthpct"]:
+                self.game.send_game_command(f"set nn_enemy_cmd_{slot:02d}_healthpct {healthpct}")
+                self._last_enemy_cmds[slot]["healthpct"] = healthpct
 
     def _apply_low_level_backend_controls(
         self, low_level_logits: np.ndarray
@@ -1931,7 +2203,8 @@ class DoomTransformerLoop:
         keyboard_state = initial_keyboard_state
 
         # Re-sample keys every single Doom tic so releasing a key stops immediately.
-        for sub_tick in range(max(1, self.config.action_repeat)):
+        sub_total = max(1, self.config.action_repeat)
+        for sub_tick in range(sub_total):
             if sub_tick > 0:
                 keyboard_state = self._sanitize_keyboard_state(self._read_keyboard_state())
             self._attack_cooldown_left = max(0, self._attack_cooldown_left - 1)
@@ -1952,6 +2225,42 @@ class DoomTransformerLoop:
                 total_reward += self.game.make_action(neutral_action, 1)
                 last_action = [0.0] * self.control_dim
 
+            self._render_current_frame()
+
+        return total_reward, last_action, keyboard_state
+
+    def _step_controls_world_sim(
+        self,
+        control_logits: np.ndarray,
+        step: int,
+        initial_keyboard_state: np.ndarray,
+        enemy_commands: list[tuple[int, int, int, int, int, int]],
+    ) -> tuple[float, list[float], np.ndarray]:
+        total_reward = 0.0
+        last_action = [0.0] * self.control_dim
+        keyboard_state = initial_keyboard_state
+        neutral_action = [0.0] * self.control_dim
+
+        # Keep Doom ticking for rendering while Transformer world-sim owns movement/combat.
+        sub_total = max(1, self.config.action_repeat)
+        for sub_tick in range(sub_total):
+            if sub_tick > 0:
+                keyboard_state = self._sanitize_keyboard_state(self._read_keyboard_state())
+            self._attack_cooldown_left = max(0, self._attack_cooldown_left - 1)
+
+            if np.any(keyboard_state > 0.1):
+                decoded_action = self._decode_controls(control_logits, step, keyboard_state)
+                action = decoded_action.copy()
+                self._apply_fire_cooldown(action, keyboard_state)
+                self._world_sim_step(action, enemy_commands, sub_steps=1)
+                last_action = action
+            else:
+                self._world_sim_step(neutral_action, enemy_commands, sub_steps=1)
+                last_action = neutral_action.copy()
+
+            total_reward += self.game.make_action(neutral_action, 1)
+            if sub_tick == sub_total - 1:
+                self._world_sim_apply_render_bridge()
             self._render_current_frame()
 
         return total_reward, last_action, keyboard_state
@@ -1978,7 +2287,9 @@ class DoomTransformerLoop:
             print("Sticky-key protection is enabled (macOS global fallback).")
         else:
             print("Sticky-key protection is disabled for this keyboard source.")
-        if self._nn_movement_resolution_active and self._collision_map is not None:
+        if self.config.nn_world_sim:
+            print("NN movement resolution path is bypassed in --nn-world-sim mode.")
+        elif self._nn_movement_resolution_active and self._collision_map is not None:
             print(
                 "NN movement resolution is ON: player movement/collision is resolved in Transformer loop "
                 f"(segments={len(self._collision_map.blocking_segments)}, move_units={self.config.nn_move_units:.2f})."
@@ -1989,6 +2300,14 @@ class DoomTransformerLoop:
             print(
                 "Enemy backend override is ON: Transformer writes per-slot enemy movement/aim/fire commands "
                 f"to {self.config.enemy_backend_mod.name}."
+            )
+        if self.config.nn_world_sim:
+            print(
+                "Experimental NN world-sim mode is ON: Transformer loop owns low-level movement/collision/combat "
+                "(Doom remains render/IO bridge)."
+            )
+            print(
+                f"NN world-sim damage scale: {self.config.nn_world_damage_scale:.2f}"
             )
         if self.config.visible:
             if self.keyboard_source == "pygame_window":
@@ -2080,6 +2399,8 @@ class DoomTransformerLoop:
 
         self._prime_history()
         self.last_position = self._current_position()
+        if self.config.nn_world_sim:
+            self._world_sim_bootstrap()
 
         step = 0
         try:
@@ -2111,11 +2432,19 @@ class DoomTransformerLoop:
                 )
 
                 keyboard_state = self._sanitize_keyboard_state(self._read_keyboard_state())
-                reward, control_action, next_keyboard = self._step_controls_responsive(
-                    control,
-                    step,
-                    keyboard_state,
-                )
+                if self.config.nn_world_sim:
+                    reward, control_action, next_keyboard = self._step_controls_world_sim(
+                        control,
+                        step,
+                        keyboard_state,
+                        enemy_cmd,
+                    )
+                else:
+                    reward, control_action, next_keyboard = self._step_controls_responsive(
+                        control,
+                        step,
+                        keyboard_state,
+                    )
                 observed_next = self._extract_state_vector(next_keyboard)
                 if observed_next is None:
                     continue
@@ -2337,6 +2666,20 @@ def parse_args() -> EmulationConfig:
         default=0.25,
         help="Low-level head logit gain before tanh decoding.",
     )
+    parser.add_argument(
+        "--nn-world-sim",
+        action="store_true",
+        help=(
+            "Experimental mode: move low-level movement/collision/combat step into Transformer-side "
+            "world simulator, while Doom remains rendering/input bridge."
+        ),
+    )
+    parser.add_argument(
+        "--nn-world-damage-scale",
+        type=float,
+        default=1.0,
+        help="Damage multiplier used by experimental NN world simulator.",
+    )
     args = parser.parse_args()
 
     wad_path = args.wad.resolve()
@@ -2398,6 +2741,8 @@ def parse_args() -> EmulationConfig:
         nn_control_gain=float(np.clip(args.nn_control_gain, 0.1, 4.0)),
         nn_enemy_gain=float(np.clip(args.nn_enemy_gain, 0.1, 4.0)),
         nn_low_level_gain=float(np.clip(args.nn_low_level_gain, 0.05, 4.0)),
+        nn_world_sim=bool(args.nn_world_sim),
+        nn_world_damage_scale=float(np.clip(args.nn_world_damage_scale, 0.1, 4.0)),
     )
 
 

@@ -52,6 +52,9 @@ python3 e1m1_transformer_backend.py --doom-ticrate 16 --doom-skill 1
 python3 build_enemy_nn_mod.py
 python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-mod enemy_nn_backend_mod.pk3 --enemy-slots 16
 
+# Experimental: move low-level movement/collision/combat into NN world simulator
+python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-mod enemy_nn_backend_mod.pk3 --nn-world-sim --nn-world-damage-scale 1.0
+
 # Headless regression runner (parses and checks enemy metrics)
 python3 run_enemy_regression.py --wad DOOM.WAD --enemy-backend-mod enemy_nn_backend_mod.pk3 --max-ticks 256
 ```
@@ -84,7 +87,8 @@ python3 run_enemy_regression.py --wad DOOM.WAD --enemy-backend-mod enemy_nn_back
   - enemy intent head (`chase/flank/retreat/hold` + timer) is currently emitted as model context/diagnostics (not in final actuator path)
 - Per-enemy memory state is maintained in-loop as a persistent latent (`10` values/slot), updated each tick only by Transformer memory-update outputs (gate + delta), and fed back into `state_in`.
   - explicit memory channels now include `target_identity_norm` and `engagement_phase_norm`.
-- Doom remains authoritative for rendering and core simulation (physics, collisions, damage, doors/triggers, pickups, map logic).
+- By default, Doom remains authoritative for rendering and core simulation (physics, collisions, damage, doors/triggers, pickups, map logic).
+- With `--nn-world-sim` (experimental), low-level movement/collision/combat are stepped in Transformer-side Python state and bridged back into Doom each tick (`warp`/`setangle` + enemy health sync).
 
 ### 2. Exact architecture and its parameters
 
@@ -154,7 +158,6 @@ Per tick, one `state_in` vector is built and then stacked over time (`context=32
   - Loads blocking linedefs from `DOOM.WAD` (current map).
   - Resolves player movement with wall/entity collision checks in Python.
   - Applies resolved position via `warp` each tic.
-  - Enemy movement commands are also pre-resolved against the same collision map before being sent to the backend mod.
 - On macOS visible runs, the script merges Doom button states with global key-state sampling (ApplicationServices) for more reliable key detection.
 - On macOS, letter-key capture requires OS permissions. If `keys=[]` while pressing letters, enable:
   - `System Settings -> Privacy & Security -> Accessibility`
