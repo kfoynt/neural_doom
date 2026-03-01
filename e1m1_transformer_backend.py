@@ -390,7 +390,9 @@ class HardcodedStateTransformer(nn.Module):
         context: int,
         enemy_slots: int = 16,
         enemy_cmd_dim: int = 1,
+        enemy_intent_dim: int = 1,
         low_level_dim: int | None = None,
+        memory_update_dim: int = 1,
         weight_scale: float = 0.55,
         d_model: int = 256,
         nhead: int = 8,
@@ -400,13 +402,17 @@ class HardcodedStateTransformer(nn.Module):
         super().__init__()
         self.enemy_slots = enemy_slots
         self.enemy_cmd_dim = enemy_cmd_dim
+        self.enemy_intent_dim = max(1, int(enemy_intent_dim))
         self.low_level_dim = low_level_dim if low_level_dim is not None else (4 + enemy_slots)
+        self.memory_update_dim = max(1, int(memory_update_dim))
         self.weight_scale = float(np.clip(weight_scale, 0.05, 2.0))
         self.in_proj = nn.Linear(state_dim, d_model)
         self.state_out_proj = nn.Linear(d_model, state_dim)
         self.control_out_proj = nn.Linear(d_model, control_dim)
         self.enemy_out_proj = nn.Linear(d_model, enemy_slots * enemy_cmd_dim)
+        self.enemy_intent_out_proj = nn.Linear(d_model, enemy_slots * self.enemy_intent_dim)
         self.low_level_out_proj = nn.Linear(d_model, self.low_level_dim)
+        self.memory_out_proj = nn.Linear(d_model, enemy_slots * self.memory_update_dim)
         self.blocks = nn.ModuleList(
             [TransformerBlockWithAttention(d_model=d_model, nhead=nhead, ff_dim=ff_dim) for _ in range(num_layers)]
         )
@@ -438,8 +444,12 @@ class HardcodedStateTransformer(nn.Module):
                     std = 0.06
                 elif "enemy_out_proj.weight" in name:
                     std = 0.03
+                elif "enemy_intent_out_proj.weight" in name:
+                    std = 0.03
                 elif "low_level_out_proj.weight" in name:
                     std = 0.02
+                elif "memory_out_proj.weight" in name:
+                    std = 0.03
                 elif "bias" in name:
                     std = 0.015
                 std *= self.weight_scale
@@ -462,7 +472,7 @@ class HardcodedStateTransformer(nn.Module):
 
     def forward(
         self, state_history: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]:
         # state_history: [batch, context, state_dim]
         seq_len = state_history.shape[1]
         x = self.in_proj(state_history)
@@ -473,12 +483,16 @@ class HardcodedStateTransformer(nn.Module):
             attention_maps.append(attn)
         head = x[:, -1, :]
         enemy_logits = self.enemy_out_proj(head).view(-1, self.enemy_slots, self.enemy_cmd_dim)
+        enemy_intent_logits = self.enemy_intent_out_proj(head).view(-1, self.enemy_slots, self.enemy_intent_dim)
         low_level_logits = self.low_level_out_proj(head)
+        memory_update_logits = self.memory_out_proj(head).view(-1, self.enemy_slots, self.memory_update_dim)
         return (
             self.state_out_proj(head),
             self.control_out_proj(head),
             enemy_logits,
+            enemy_intent_logits,
             low_level_logits,
+            memory_update_logits,
             attention_maps,
         )
 
@@ -550,16 +564,21 @@ class DoomTransformerLoop:
         ]
         self.control_dim = len(self.control_buttons)
         self.enemy_behavior_core_channels = (
-            "speed_drive",
-            "fwd_drive",
-            "side_drive",
-            "turn_drive",
-            "aim_enable_logit",
-            "fire_pulse_logit",
-            "cooldown_ticks_intent",
-            "burst_ticks_intent",
-            "fire_threshold_intent",
-            "health_intent",
+            "speed_cmd",
+            "advance_cmd",
+            "strafe_cmd",
+            "turn_cmd",
+            "aim_cmd_logit",
+            "fire_cmd_logit",
+            "advance_conf",
+            "strafe_conf",
+            "turn_conf",
+            "aim_conf",
+            "fire_conf",
+            "firecd_cmd_norm",
+            "health_cmd_norm",
+            "target_hold_gate",
+            "retarget_gate",
         )
         self.enemy_target_channels = ("target_player_logit",) + tuple(
             f"target_slot_{slot:02d}_logit" for slot in range(self.config.enemy_slots)
@@ -568,9 +587,19 @@ class DoomTransformerLoop:
         self.enemy_behavior_core_dim = len(self.enemy_behavior_core_channels)
         self.enemy_target_dim = len(self.enemy_target_channels)
         self.enemy_cmd_dim = len(self.enemy_behavior_channels)
+        self.enemy_intent_channels = (
+            "intent_chase_logit",
+            "intent_flank_logit",
+            "intent_retreat_logit",
+            "intent_hold_logit",
+            "intent_timer_norm",
+        )
+        self.enemy_intent_dim = len(self.enemy_intent_channels)
+        self.enemy_intent_names = ("chase", "flank", "retreat", "hold")
         self.enemy_base_feature_dim = 11
         self.enemy_feedback_feature_dim = 11
         self.enemy_memory_feature_dim = 8
+        self.enemy_memory_update_dim = 1 + self.enemy_memory_feature_dim
         self.enemy_feature_dim = (
             self.enemy_base_feature_dim + self.enemy_feedback_feature_dim + self.enemy_memory_feature_dim
         )
@@ -617,6 +646,8 @@ class DoomTransformerLoop:
         self._enemy_prev_angle = np.full(self.config.enemy_slots, np.nan, dtype=np.float32)
         self._enemy_prev_los = np.zeros(self.config.enemy_slots, dtype=np.float32)
         self._enemy_last_cmd = np.zeros((self.config.enemy_slots, 6), dtype=np.float32)
+        self._enemy_intent_state = np.zeros(self.config.enemy_slots, dtype=np.int32)
+        self._enemy_intent_timer = np.zeros(self.config.enemy_slots, dtype=np.float32)
         self._enemy_memory = np.zeros(
             (self.config.enemy_slots, self.enemy_memory_feature_dim),
             dtype=np.float32,
@@ -639,7 +670,9 @@ class DoomTransformerLoop:
             context=self.config.context,
             enemy_slots=self.config.enemy_slots,
             enemy_cmd_dim=self.enemy_cmd_dim,
+            enemy_intent_dim=self.enemy_intent_dim,
             low_level_dim=self.low_level_dim,
+            memory_update_dim=self.enemy_memory_update_dim,
             weight_scale=self.config.nn_weight_scale,
         ).to(self.config.device)
         self.history: Deque[np.ndarray] = deque(maxlen=self.config.context)
@@ -654,8 +687,6 @@ class DoomTransformerLoop:
         self._runtime_move_scale = 1.0
         self._runtime_turn_scale = 1.0
         self._runtime_fire_cooldown_tics = self.config.fire_cooldown_tics
-        self._enemy_burst_left = np.zeros(self.config.enemy_slots, dtype=np.int32)
-        self._enemy_cooldown_left = np.zeros(self.config.enemy_slots, dtype=np.int32)
         self._enemy_target_choice = np.zeros(self.config.enemy_slots, dtype=np.int32)
         self._map_geometry: WADCollisionMap | None = None
         try:
@@ -934,8 +965,8 @@ class DoomTransformerLoop:
                 self._enemy_prev_angle[slot] = np.nan
                 self._enemy_prev_los[slot] = 0.0
                 self._enemy_last_cmd[slot, :] = 0.0
-                self._enemy_burst_left[slot] = 0
-                self._enemy_cooldown_left[slot] = 0
+                self._enemy_intent_state[slot] = 0
+                self._enemy_intent_timer[slot] = 0.0
                 self._enemy_target_choice[slot] = 0
                 self._enemy_memory[slot, :] = 0.0
 
@@ -962,8 +993,8 @@ class DoomTransformerLoop:
                 self._enemy_prev_angle[slot] = np.nan
                 self._enemy_prev_los[slot] = 0.0
                 self._enemy_last_cmd[slot, :] = 0.0
-                self._enemy_burst_left[slot] = 0
-                self._enemy_cooldown_left[slot] = 0
+                self._enemy_intent_state[slot] = 0
+                self._enemy_intent_timer[slot] = 0.0
                 self._enemy_target_choice[slot] = 0
                 self._enemy_memory[slot, :] = 0.0
                 continue
@@ -1002,7 +1033,7 @@ class DoomTransformerLoop:
             # Per-slot feature layout:
             # Base: alive, x, y, vx, vy, angle, health_proxy, dist_to_player, bearing_to_player, line_of_sight, cooldown_proxy
             # Feedback: last command + observed response
-            # Memory: persistent EMA latent (updated each tick from decoded enemy actuation).
+            # Memory: persistent latent updated by Transformer memory gate+delta outputs.
             block[base + 0] = 100.0
             block[base + 1] = float(np.clip(dx, -4096.0, 4096.0))
             block[base + 2] = float(np.clip(dy, -4096.0, 4096.0))
@@ -1054,7 +1085,7 @@ class DoomTransformerLoop:
             block[fb + 10] = shot_fired
 
             mb = fb + self.enemy_feedback_feature_dim
-            # Memory: EMA latent over [fwd,side,turn,speed,aim,fire,target_choice,cadence_bias].
+            # Memory latent channels (NN state with intent/timer diagnostics overlaid).
             memory = np.clip(self._enemy_memory[slot], -1.0, 1.0)
             block[mb : mb + self.enemy_memory_feature_dim] = memory * 100.0
 
@@ -1123,7 +1154,9 @@ class DoomTransformerLoop:
         target_logits: np.ndarray,
         player_x: float,
         player_y: float,
-    ) -> tuple[float, float, int]:
+        hold_gate: float,
+        retarget_gate: float,
+    ) -> tuple[float, float, int, float]:
         candidate_points: list[tuple[float, float]] = [(player_x, player_y)]
         valid: list[bool] = [True]
         for target_slot in range(self.config.enemy_slots):
@@ -1147,34 +1180,42 @@ class DoomTransformerLoop:
         for idx, is_valid in enumerate(valid):
             if not is_valid:
                 masked[idx] = -1e9
-        # Small prior keeps gameplay coherent while still allowing non-player selections.
-        masked[0] += 0.10
 
-        selected = int(np.argmax(masked))
-        if not np.isfinite(float(masked[selected])):
-            selected = 0
+        selected_raw = int(np.argmax(masked))
+        if not np.isfinite(float(masked[selected_raw])):
+            selected_raw = 0
         previous = int(self._enemy_target_choice[slot])
-        if 0 <= previous < len(valid) and valid[previous]:
-            # Hysteresis to avoid rapid target flicker from near-tied logits.
-            if float(masked[previous]) >= float(masked[selected]) - 0.20:
-                selected = previous
+        selected = selected_raw
+        prev_valid = 0 <= previous < len(valid) and valid[previous]
+        hold = float(np.clip(hold_gate, 0.0, 1.0))
+        retarget = float(np.clip(retarget_gate, 0.0, 1.0))
+        # Direct NN gate decode: hold keeps previous target, retarget takes fresh argmax.
+        if prev_valid and hold >= 0.5 and retarget < 0.5:
+            selected = previous
         self._enemy_target_choice[slot] = selected
 
+        confidence = 0.0
+        valid_indices = [idx for idx, is_valid in enumerate(valid) if is_valid]
+        if valid_indices and 0 <= selected < len(valid):
+            scores = np.asarray([masked[idx] for idx in valid_indices], dtype=np.float32)
+            scores = scores - float(np.max(scores))
+            probs = np.exp(scores)
+            probs_sum = float(np.sum(probs))
+            if probs_sum > 1e-8:
+                probs /= probs_sum
+                try:
+                    sel_pos = valid_indices.index(selected)
+                    confidence = float(probs[sel_pos])
+                except ValueError:
+                    confidence = 0.0
+
         target_x, target_y = candidate_points[selected]
-        return float(target_x), float(target_y), selected
+        return float(target_x), float(target_y), selected, confidence
 
     def _update_enemy_memory_state(
         self,
         slot: int,
-        fwd: int,
-        side: int,
-        turn: int,
-        speed: int,
-        aim: int,
-        fire: int,
-        target_index: int,
-        firecd: int,
-        burst: int,
+        memory_update_logits: np.ndarray,
     ) -> None:
         if slot < 0 or slot >= self.config.enemy_slots:
             return
@@ -1182,26 +1223,49 @@ class DoomTransformerLoop:
         if memory.shape[0] != self.enemy_memory_feature_dim:
             return
 
-        target_den = max(1, self.enemy_target_dim - 1)
-        target_norm = float(np.clip((target_index / target_den) * 2.0 - 1.0, -1.0, 1.0))
-        cadence_norm = float(
-            np.clip(((burst - 1.0) / 7.0) - ((firecd - 2.0) / 26.0), -1.0, 1.0)
-        )
-        observe = np.asarray(
-            [
-                np.clip(fwd / 100.0, -1.0, 1.0),
-                np.clip(side / 100.0, -1.0, 1.0),
-                np.clip(turn / 120.0, -1.0, 1.0),
-                np.clip((speed - 100.0) / 120.0, -1.0, 1.0),
-                1.0 if aim > 0 else 0.0,
-                1.0 if fire > 0 else 0.0,
-                target_norm,
-                cadence_norm,
-            ],
-            dtype=np.float32,
-        )
-        decay = 0.92
-        memory[:] = decay * memory + (1.0 - decay) * observe
+        update = np.asarray(memory_update_logits, dtype=np.float32).reshape(-1)
+        if update.size < self.enemy_memory_update_dim:
+            padded = np.zeros(self.enemy_memory_update_dim, dtype=np.float32)
+            padded[: update.size] = update
+            update = padded
+        else:
+            update = update[: self.enemy_memory_update_dim]
+
+        gate = float(np.clip(0.5 + 0.5 * np.tanh(float(update[0])), 0.02, 0.98))
+        delta = np.tanh(update[1 : 1 + self.enemy_memory_feature_dim])
+        # Fully NN-driven memory evolution: gate + delta are produced by Transformer.
+        memory[:] = np.tanh((1.0 - gate) * memory + gate * delta)
+
+    def _decode_enemy_intent_state(
+        self,
+        slot: int,
+        intent_logits: np.ndarray,
+    ) -> tuple[int, float, np.ndarray]:
+        values = np.asarray(intent_logits, dtype=np.float32).reshape(-1)
+        if values.size < self.enemy_intent_dim:
+            padded = np.zeros(self.enemy_intent_dim, dtype=np.float32)
+            padded[: values.size] = values
+            values = padded
+        else:
+            values = values[: self.enemy_intent_dim]
+
+        intent_scores = values[: len(self.enemy_intent_names)] * self._enemy_logit_gain
+        timer_norm = float(np.clip(0.5 + 0.5 * np.tanh(float(values[-1])), 0.0, 1.0))
+        scores = intent_scores.astype(np.float32)
+        scores = scores - float(np.max(scores))
+        probs = np.exp(scores)
+        denom = float(np.sum(probs))
+        if denom > 1e-8:
+            probs /= denom
+        else:
+            probs[:] = 0.0
+            probs[0] = 1.0
+        current = int(np.argmax(probs))
+        # Timer is NN-authoritative each tick (no Python countdown/hysteresis).
+        timer_left = float(np.clip(round(2.0 + 30.0 * timer_norm), 2, 32))
+        self._enemy_intent_state[slot] = current
+        self._enemy_intent_timer[slot] = timer_left
+        return current, timer_norm, probs
 
     def _apply_player_motion_resolution(self, action: list[float]) -> bool:
         if self._collision_map is None:
@@ -1242,7 +1306,10 @@ class DoomTransformerLoop:
         return False
 
     def _apply_enemy_backend_commands(
-        self, enemy_logits: np.ndarray
+        self,
+        enemy_logits: np.ndarray,
+        enemy_intent_logits: np.ndarray | None = None,
+        memory_update_logits: np.ndarray | None = None,
     ) -> tuple[int, list[tuple[int, int, int, int, int, int]]]:
         if not self.config.enemy_backend_transformer:
             return 0, []
@@ -1256,66 +1323,108 @@ class DoomTransformerLoop:
             if enemy is not None
         ]
         commands: list[tuple[int, int, int, int, int, int]] = []
+        if memory_update_logits is None:
+            memory_updates = np.zeros(
+                (self.config.enemy_slots, self.enemy_memory_update_dim),
+                dtype=np.float32,
+            )
+        else:
+            mem = np.asarray(memory_update_logits, dtype=np.float32)
+            if mem.ndim == 1:
+                mem = mem.reshape(1, -1)
+            if mem.shape[0] < self.config.enemy_slots:
+                padded = np.zeros((self.config.enemy_slots, mem.shape[1]), dtype=np.float32)
+                padded[: mem.shape[0], :] = mem
+                mem = padded
+            memory_updates = mem
+        if enemy_intent_logits is None:
+            intent_updates = np.zeros(
+                (self.config.enemy_slots, self.enemy_intent_dim),
+                dtype=np.float32,
+            )
+        else:
+            intent = np.asarray(enemy_intent_logits, dtype=np.float32)
+            if intent.ndim == 1:
+                intent = intent.reshape(1, -1)
+            if intent.shape[0] < self.config.enemy_slots:
+                padded = np.zeros((self.config.enemy_slots, intent.shape[1]), dtype=np.float32)
+                padded[: intent.shape[0], :] = intent
+                intent = padded
+            intent_updates = intent
         for slot in range(self.config.enemy_slots):
             enemy = slot_enemies[slot] if slot < len(slot_enemies) else None
             if enemy is not None:
-                logits = np.asarray(enemy_logits[slot], dtype=np.float32) * self._enemy_logit_gain
+                slot_logits = np.asarray(enemy_logits[slot], dtype=np.float32).reshape(-1)
+                if slot_logits.size < self.enemy_cmd_dim:
+                    padded = np.zeros(self.enemy_cmd_dim, dtype=np.float32)
+                    padded[: slot_logits.size] = slot_logits
+                    slot_logits = padded
+                else:
+                    slot_logits = slot_logits[: self.enemy_cmd_dim]
+                logits = slot_logits * self._enemy_logit_gain
                 drive = np.tanh(logits)
-                speed_drive = float(drive[0])
-                fwd_drive = float(drive[1])
-                side_drive = float(drive[2])
-                turn_drive = float(drive[3])
-                aim_enable_logit = float(drive[4])
-                fire_pulse_logit = float(drive[5])
-                cooldown_ticks_intent = float(0.5 + 0.5 * drive[6])
-                burst_ticks_intent = float(0.5 + 0.5 * drive[7])
-                fire_threshold_intent = float(0.5 + 0.5 * drive[8])
-                health_intent = float(0.5 + 0.5 * drive[9])
+
+                speed_cmd = float(drive[0])
+                advance_cmd = float(drive[1])
+                strafe_cmd = float(drive[2])
+                turn_cmd = float(drive[3])
+                aim_cmd_logit = float(drive[4])
+                fire_cmd_logit = float(drive[5])
+                advance_conf = float(0.5 + 0.5 * drive[6])
+                strafe_conf = float(0.5 + 0.5 * drive[7])
+                turn_conf = float(0.5 + 0.5 * drive[8])
+                aim_conf = float(0.5 + 0.5 * drive[9])
+                fire_conf = float(0.5 + 0.5 * drive[10])
+                firecd_cmd_norm = float(0.5 + 0.5 * drive[11])
+                health_cmd_norm = float(0.5 + 0.5 * drive[12])
+                hold_gate = float(0.5 + 0.5 * drive[13])
+                retarget_gate = float(0.5 + 0.5 * drive[14])
                 target_logits = logits[
                     self.enemy_behavior_core_dim : self.enemy_behavior_core_dim + self.enemy_target_dim
                 ]
 
-                # Keep target selection state updated from NN outputs (used by target-selection step).
-                _target_x, _target_y, _target_index = self._select_enemy_target_point(
+                # Target selection remains NN-driven (logits + hold/retarget gates), but
+                # backend actuation below is decoded directly from NN channels.
+                _target_x, _target_y, _target_index, target_confidence = self._select_enemy_target_point(
                     slot,
                     slot_enemies,
                     target_logits,
                     player_x,
                     player_y,
+                    hold_gate,
+                    retarget_gate,
                 )
-                # Step 1: movement/pathing is direct from Transformer outputs.
-                speed = int(np.clip(round(100.0 + 120.0 * speed_drive), 35, 230))
+
+                intent_id, intent_timer_norm, intent_probs = self._decode_enemy_intent_state(slot, intent_updates[slot])
+                chase_p, flank_p, retreat_p, hold_p = [float(v) for v in intent_probs]
+                move_gain = float(np.clip(0.35 + 0.65 * (chase_p + flank_p), 0.2, 1.0))
+                strafe_gain = float(np.clip(0.35 + 0.65 * (flank_p + retreat_p), 0.2, 1.0))
+                turn_gain = float(np.clip(0.35 + 0.65 * (flank_p + hold_p), 0.2, 1.0))
+                aim_gate = float(np.clip(chase_p + hold_p, 0.0, 1.0))
+                fire_gate = float(np.clip(chase_p + 0.5 * hold_p, 0.0, 1.0))
+                retreat_sign = float(np.clip(1.0 - 2.0 * retreat_p, -1.0, 1.0))
+
+                # Step 1: direct NN decode with explicit confidence channels.
+                speed = int(np.clip(round(35.0 + 195.0 * (0.5 + 0.5 * speed_cmd)), 35, 230))
+                fwd_drive = float(np.clip(advance_cmd * advance_conf * move_gain * retreat_sign, -1.0, 1.0))
+                side_drive = float(np.clip(strafe_cmd * strafe_conf * strafe_gain, -1.0, 1.0))
+                turn_drive = float(np.clip(turn_cmd * turn_conf * turn_gain, -1.0, 1.0))
                 fwd = int(np.clip(round(100.0 * fwd_drive), -100, 100))
                 side = int(np.clip(round(100.0 * side_drive), -100, 100))
                 turn = int(np.clip(round(120.0 * turn_drive), -120, 120))
-
-                # Step 2: aim/fire authority is fully direct from Transformer outputs.
-                # No rule-gated aim_score/fire_want heuristics.
-                aim = 1 if aim_enable_logit > 0.10 else 0
-                fire_threshold = float(np.clip(-0.35 + 1.10 * fire_threshold_intent, -0.35, 0.75))
-                fire_pulse = bool(fire_pulse_logit > fire_threshold)
-                cadence_firecd = int(np.clip(round(2.0 + 26.0 * cooldown_ticks_intent), 2, 28))
-                cadence_burst = int(np.clip(round(1.0 + 7.0 * burst_ticks_intent), 1, 8))
+                aim_strength = float(aim_cmd_logit * aim_conf * aim_gate)
+                fire_strength = float(fire_cmd_logit * fire_conf * fire_gate)
+                aim = 1 if aim_strength > 0.05 else 0
+                fire = 1 if fire_strength > 0.05 else 0
+                cadence_firecd = int(np.clip(round(2.0 + 26.0 * firecd_cmd_norm), 2, 28))
                 if cadence_firecd != self._last_enemy_cmds[slot]["firecd"]:
                     self.game.send_game_command(f"set nn_enemy_cmd_{slot:02d}_firecd {cadence_firecd}")
                     self._last_enemy_cmds[slot]["firecd"] = cadence_firecd
 
-                healthpct = int(np.clip(round(40.0 + 160.0 * health_intent), 40, 200))
+                healthpct = int(np.clip(round(40.0 + 160.0 * health_cmd_norm), 40, 200))
                 if healthpct != self._last_enemy_cmds[slot]["healthpct"]:
                     self.game.send_game_command(f"set nn_enemy_cmd_{slot:02d}_healthpct {healthpct}")
                     self._last_enemy_cmds[slot]["healthpct"] = healthpct
-
-                fire = 0
-                if self._enemy_cooldown_left[slot] > 0:
-                    self._enemy_cooldown_left[slot] -= 1
-                else:
-                    if fire_pulse and self._enemy_burst_left[slot] <= 0:
-                        self._enemy_burst_left[slot] = cadence_burst
-                    if self._enemy_burst_left[slot] > 0:
-                        fire = 1
-                        self._enemy_burst_left[slot] -= 1
-                        if self._enemy_burst_left[slot] <= 0:
-                            self._enemy_cooldown_left[slot] = cadence_firecd
 
                 if self._collision_map is not None:
                     dynamic: list[tuple[float, float, float]] = [(player_x, player_y, 16.0)]
@@ -1328,16 +1437,23 @@ class DoomTransformerLoop:
 
                 self._update_enemy_memory_state(
                     slot=slot,
-                    fwd=fwd,
-                    side=side,
-                    turn=turn,
-                    speed=speed,
-                    aim=aim,
-                    fire=fire,
-                    target_index=int(_target_index),
-                    firecd=cadence_firecd,
-                    burst=cadence_burst,
+                    memory_update_logits=memory_updates[slot],
                 )
+                # Reserve memory channels for explicit intent state + timer diagnostics.
+                memory = self._enemy_memory[slot]
+                intent_code = -np.ones(len(self.enemy_intent_names), dtype=np.float32)
+                intent_code[intent_id] = 1.0
+                memory[0:4] = 0.5 * memory[0:4] + 0.5 * intent_code
+                memory[4] = float(np.clip(2.0 * intent_timer_norm - 1.0, -1.0, 1.0))
+                memory[5] = float(np.clip(2.0 * target_confidence - 1.0, -1.0, 1.0))
+                memory[6] = float(
+                    np.clip(
+                        (float(self._enemy_target_choice[slot]) / float(max(1, self.enemy_target_dim - 1))) * 2.0 - 1.0,
+                        -1.0,
+                        1.0,
+                    )
+                )
+                memory[7] = float(np.clip(2.0 * firecd_cmd_norm - 1.0, -1.0, 1.0))
             else:
                 speed = 100
                 fwd = 0
@@ -1345,8 +1461,8 @@ class DoomTransformerLoop:
                 turn = 0
                 aim = 0
                 fire = 0
-                self._enemy_burst_left[slot] = 0
-                self._enemy_cooldown_left[slot] = 0
+                self._enemy_intent_state[slot] = 0
+                self._enemy_intent_timer[slot] = 0.0
                 self._enemy_target_choice[slot] = 0
                 self._enemy_memory[slot, :] = 0.0
                 healthpct = 100
@@ -1466,8 +1582,6 @@ class DoomTransformerLoop:
         self._enemy_prev_angle.fill(np.nan)
         self._enemy_prev_los.fill(0.0)
         self._enemy_last_cmd.fill(0.0)
-        self._enemy_burst_left.fill(0)
-        self._enemy_cooldown_left.fill(0)
         self._enemy_target_choice.fill(0)
         self._enemy_memory.fill(0.0)
         initial_keyboard = self._read_keyboard_state()
@@ -1706,6 +1820,14 @@ class DoomTransformerLoop:
             f"Enemy behavior head: channels={self.enemy_cmd_dim} "
             f"{'/'.join(self.enemy_behavior_channels)}"
         )
+        print(
+            f"Enemy intent head: channels={self.enemy_intent_dim} "
+            f"{'/'.join(self.enemy_intent_channels)}"
+        )
+        print(
+            f"Enemy memory-update head: channels={self.enemy_memory_update_dim} "
+            "(gate + 8-dim delta per slot)"
+        )
         print(f"State dim: {self.state_dim} | Transformer context: {self.config.context}")
 
         self._prime_history()
@@ -1719,13 +1841,23 @@ class DoomTransformerLoop:
 
                 inputs = self._history_tensor()
                 with torch.no_grad():
-                    predicted_state, control_logits, enemy_logits, low_level_logits, _ = self.model(inputs)
+                    (
+                        predicted_state,
+                        control_logits,
+                        enemy_logits,
+                        enemy_intent_logits,
+                        low_level_logits,
+                        memory_update_logits,
+                        _,
+                    ) = self.model(inputs)
                 predicted = predicted_state.cpu().numpy()[0]
                 control = control_logits.cpu().numpy()[0]
                 enemy = enemy_logits.cpu().numpy()[0]
+                enemy_intent = enemy_intent_logits.cpu().numpy()[0]
                 low_level = low_level_logits.cpu().numpy()[0]
+                memory_update = memory_update_logits.cpu().numpy()[0]
                 move_scale, turn_scale, fire_cd, enemy_low = self._apply_low_level_backend_controls(low_level)
-                enemy_count, enemy_cmd = self._apply_enemy_backend_commands(enemy)
+                enemy_count, enemy_cmd = self._apply_enemy_backend_commands(enemy, enemy_intent, memory_update)
 
                 keyboard_state = self._sanitize_keyboard_state(self._read_keyboard_state())
                 reward, control_action, next_keyboard = self._step_controls_responsive(

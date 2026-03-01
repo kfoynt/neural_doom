@@ -61,21 +61,25 @@ python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-
   - `state_out` (predicted next backend state vector).
   - `control_logits` (decoded into Doom control actions).
   - `enemy_logits` (per-slot enemy backend command logits when enemy backend mode is enabled).
+  - `enemy_intent_logits` (per-slot intent logits + timer signal for NN-space enemy state machine).
   - `low_level_logits` (non-standard backend knobs for player dynamics, plus enemy firecd proxy diagnostics).
+  - `memory_update_logits` (per-slot memory update channels: gate + delta for persistent enemy latent state).
 - The player action sent to Doom is computed from Transformer logits each tick (keyboard-gated, NN-modulated strength/conflict resolution).
 - In `--enemy-backend-transformer` mode, the loop also sends per-slot enemy commands to a custom mod (`enemy_nn_backend_mod.pk3`) each tick:
   - Transformer behavior channels are decoded into backend actuation:
-    - behavior channels: core control channels (`speed_drive`, `fwd_drive`, `side_drive`, `turn_drive`, `aim_enable_logit`, `fire_pulse_logit`, `cooldown_ticks_intent`, `burst_ticks_intent`, `fire_threshold_intent`, `health_intent`) plus target-selection logits (`target_player_logit`, `target_slot_00_logit` ... `target_slot_15_logit`)
-    - per-slot target logits are used each tick to select the enemy target point (player or another tracked slot)
-    - movement/pathing is now direct from NN channels: `speed_drive -> speed`, `fwd_drive -> fwd`, `side_drive -> side`, `turn_drive -> turn` (no range/pressure/disengage/flank blending in decoder)
+    - behavior channels: 15 core channels (`speed_cmd`, `advance_cmd`, `strafe_cmd`, `turn_cmd`, `aim_cmd_logit`, `fire_cmd_logit`, `advance_conf`, `strafe_conf`, `turn_conf`, `aim_conf`, `fire_conf`, `firecd_cmd_norm`, `health_cmd_norm`, `target_hold_gate`, `retarget_gate`) plus target-selection logits (`target_player_logit`, `target_slot_00_logit` ... `target_slot_15_logit`)
+    - per-slot target logits are used each tick to select the enemy target point (player or another tracked slot), with `target_hold_gate` / `retarget_gate` decoded directly as hold/retarget gates (no score-shaping arbitration)
+    - movement/pathing/aim/fire are now decoded directly from NN outputs with explicit confidence channels (no Python-side geometric combat heuristics)
     - actuation channels sent to Doom/mod: `speed`, `fwd`, `side`, `turn`, `aim`, `fire`
-  - aiming/firing are direct from enemy outputs:
-    - `aim_enable_logit` -> backend `aim` flag
-    - `fire_pulse_logit` + `fire_threshold_intent` -> burst trigger
-    - `cooldown_ticks_intent` + `burst_ticks_intent` -> backend fire cadence (`nn_enemy_cmd_*_firecd`, burst length)
-  - enemy health (`nn_enemy_cmd_*_healthpct`) is now driven from enemy behavior channel `health_intent`
+  - aiming/firing are confidence-gated from enemy outputs:
+    - `aim_cmd_logit` + `aim_conf` -> backend `aim`
+    - `fire_cmd_logit` + `fire_conf` -> backend `fire`
+    - `firecd_cmd_norm` -> backend `nn_enemy_cmd_*_firecd`
+    - no Python-side burst/cooldown state machine is used for enemy firing timeline
+  - enemy health (`nn_enemy_cmd_*_healthpct`) is now driven from `health_cmd_norm`
+  - separate enemy intent head (`chase/flank/retreat/hold` + timer) is decoded directly each tick (no Python-side timer countdown/hysteresis)
   - low-level channels keep a firecd proxy for diagnostics only
-- Per-enemy memory state is maintained in-loop as a persistent latent (`8` values/slot), updated each tick from decoded enemy actuation, and fed back into `state_in`.
+- Per-enemy memory state is maintained in-loop as a persistent latent (`8` values/slot), updated each tick by Transformer memory-update outputs (gate + delta), with intent/timer diagnostics overlaid for state feedback into `state_in`.
 - Doom remains authoritative for rendering and core simulation (physics, collisions, damage, doors/triggers, pickups, map logic).
 
 ### 2. Exact architecture and its parameters
@@ -89,8 +93,10 @@ python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-
 - Output heads:
   - `state_out_proj`: `Linear(256 -> state_dim)`.
   - `control_out_proj`: `Linear(256 -> 6)`.
-  - `enemy_out_proj`: `Linear(256 -> enemy_slots * enemy_cmd_dim)` (default `16 * 27`; 10 core channels + 17 target logits per slot).
+  - `enemy_out_proj`: `Linear(256 -> enemy_slots * enemy_cmd_dim)` (default `16 * 32`; 15 core channels + 17 target logits per slot).
+  - `enemy_intent_out_proj`: `Linear(256 -> enemy_slots * enemy_intent_dim)` (default `16 * 5`; 4 intent logits + 1 timer signal per slot).
   - `low_level_out_proj`: `Linear(256 -> low_level_dim)` where `low_level_dim = 4 + enemy_slots * 1` (default `20`).
+  - `memory_out_proj`: `Linear(256 -> enemy_slots * memory_update_dim)` where `memory_update_dim = 1 + memory_dim` (default `9` = gate + 8-delta).
 - Context length: `32`.
 - Training: none. Weights are deterministic hardcoded at startup and frozen (`requires_grad=False`).
 
@@ -98,11 +104,11 @@ python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-
 
 - Default runtime (`1024x768`, `frame_pool=16`):
   - `state_dim = 3694`.
-  - Total parameters: `4,121,400`.
+  - Total parameters: `4,199,528`.
   - Trainable parameters: `0`.
 - At `1280x960` with `frame_pool=16`:
   - `state_dim = 5422`.
-  - Total parameters: `5,007,864`.
+  - Total parameters: `5,085,992`.
 
 ### 4. Input features
 
@@ -117,7 +123,7 @@ Per tick, one `state_in` vector is built and then stacked over time (`context=32
 - Enemy slot features: `enemy_slots * 30` values (default `16 * 30 = 480`), with stable ID->slot tracking:
   - Base features (`11`/slot): alive flag, relative x/y, velocity x/y, facing angle, health proxy, distance to player, bearing to player, line-of-sight flag, cooldown proxy.
   - Feedback features (`11`/slot): last command (`speed/fwd/side/turn/aim/fire`) and observed response (`moved_dist`, `turn_delta`, `LOS_changed`, `blocked`, `shot_fired`).
-  - Memory features (`8`/slot): persistent EMA latent over enemy actuation (`fwd`, `side`, `turn`, `speed`, `aim`, `fire`, selected target index, cadence bias).
+- Memory features (`8`/slot): persistent NN-updated latent channels with intent/timer diagnostics overlaid (`intent_1hot[4]`, timer, target confidence/index, cadence proxy), carried across ticks and fed back into `state_in`.
 
 ### 5. Input feature description
 
@@ -159,9 +165,10 @@ Per tick, one `state_in` vector is built and then stacked over time (`context=32
   - `state_out` (next state vector)
   - control logits (decoded to Doom buttons)
   - enemy logits (decoded to per-slot enemy backend movement/aim/fire + cadence commands when enabled)
-  - low-level logits (decoded to non-standard player dynamics + enemy health channel)
+  - enemy intent logits (decoded to per-slot intent state machine: chase/flank/retreat/hold + timer)
+  - low-level logits (decoded to non-standard player dynamics + enemy firecd proxy diagnostics)
 - Player control is keyboard-gated but now NN-modulated each tick: control logits scale movement/turn strength, and still resolve opposing-key conflicts.
 - Experimental enemy-backend mode:
   - Build mod with `python3 build_enemy_nn_mod.py`.
   - Enable with `--enemy-backend-transformer --enemy-backend-mod enemy_nn_backend_mod.pk3`.
-  - Current mod implementation applies per-slot monster movement/pathing, aiming, and firing control commands from Transformer outputs.
+  - Current implementation applies per-slot monster movement/pathing/aiming/firing control commands from Transformer outputs, with target selection and intent-state updates decoded in the Python Transformer backend loop.
