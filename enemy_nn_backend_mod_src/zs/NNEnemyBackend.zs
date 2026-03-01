@@ -21,16 +21,45 @@ class NNEnemyBackendHandler : EventHandler
         return v.GetInt();
     }
 
+    private double ReadSlotFloat(int slot, String suffix, double fallback)
+    {
+        String cvarName = String.Format("nn_enemy_cmd_%02d_%s", slot, suffix);
+        CVar v = CVar.FindCVar(cvarName);
+        if (v == null)
+        {
+            return fallback;
+        }
+        return v.GetFloat();
+    }
+
+    private double Clamp(double x, double lo, double hi)
+    {
+        if (x < lo) return lo;
+        if (x > hi) return hi;
+        return x;
+    }
+
     private void ApplyEnemySlotCommand(Actor mo, Actor player, int slot)
     {
-        int speedPct = ReadSlotInt(slot, "speed", 100);
-        int fwdPct = ReadSlotInt(slot, "fwd", 0);
-        int sidePct = ReadSlotInt(slot, "side", 0);
-        int turnCmd = ReadSlotInt(slot, "turn", 0);
-        int aimCmd = ReadSlotInt(slot, "aim", 0);
-        int fireCmd = ReadSlotInt(slot, "fire", 0);
-        int fireCooldownCmd = ReadSlotInt(slot, "firecd", 12);
-        int healthPct = ReadSlotInt(slot, "healthpct", 100);
+        double presentNorm = Clamp(ReadSlotFloat(slot, "present_norm", 1.0), -1.0, 1.0);
+        double speedNorm = Clamp(ReadSlotFloat(slot, "speed_norm", 0.0), -1.0, 1.0);
+        double fwdNorm = Clamp(ReadSlotFloat(slot, "fwd_norm", 0.0), -1.0, 1.0);
+        double sideNorm = Clamp(ReadSlotFloat(slot, "side_norm", 0.0), -1.0, 1.0);
+        double turnNorm = Clamp(ReadSlotFloat(slot, "turn_norm", 0.0), -1.0, 1.0);
+        double aimNorm = Clamp(ReadSlotFloat(slot, "aim_norm", 0.0), -1.0, 1.0);
+        double fireNorm = Clamp(ReadSlotFloat(slot, "fire_norm", 0.0), -1.0, 1.0);
+        double fireCdNorm = Clamp(ReadSlotFloat(slot, "firecd_norm", 0.5), 0.0, 1.0);
+        double healthNorm = Clamp(ReadSlotFloat(slot, "health_norm", 0.5), 0.0, 1.0);
+        double targetNorm = Clamp(ReadSlotFloat(slot, "target_norm", 0.0), -1.0, 1.0);
+
+        int speedPct = int(30.0 + 220.0 * (0.5 + 0.5 * speedNorm));
+        int fwdPct = int(100.0 * fwdNorm);
+        int sidePct = int(100.0 * sideNorm);
+        int turnCmd = int(120.0 * turnNorm);
+        int aimCmd = (aimNorm > 0.0) ? 1 : 0;
+        int fireCmd = (fireNorm > 0.0) ? 1 : 0;
+        int fireCooldownCmd = int(1.0 + 34.0 * fireCdNorm);
+        int healthPct = int(20.0 + 280.0 * healthNorm);
 
         if (speedPct < 30)
         {
@@ -77,8 +106,15 @@ class NNEnemyBackendHandler : EventHandler
         mo.target = null;
         mo.threshold = 0;
 
+        if (presentNorm < -0.5)
+        {
+            mo.Vel.X = 0.0;
+            mo.Vel.Y = 0.0;
+            return;
+        }
+
         mo.Angle += turnCmd;
-        if (aimCmd > 0 && player != null && player.health > 0)
+        if (aimCmd > 0 && targetNorm > -0.95 && player != null && player.health > 0)
         {
             mo.target = player;
             mo.A_FaceTarget();
@@ -99,7 +135,7 @@ class NNEnemyBackendHandler : EventHandler
         }
         if (fireCmd > 0 && fireCooldown[slot] <= 0)
         {
-            if (player != null && player.health > 0)
+            if (targetNorm > -0.95 && player != null && player.health > 0)
             {
                 mo.target = player;
             }

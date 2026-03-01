@@ -38,12 +38,14 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated max-tick suite list (e.g. 5000,20000).",
     )
     p.add_argument(
+        "--quick",
+        action="store_true",
+        help="Run only explicitly requested cases (disables mandatory release-suite expansion).",
+    )
+    p.add_argument(
         "--release-gate",
         action="store_true",
-        help=(
-            "Run release criteria suite by default: multi-map, multi-seed, and 5000+20000 tick gates "
-            "(unless overridden with --maps/--seeds/--tick-suites)."
-        ),
+        help="Compatibility flag (release-suite expansion is mandatory by default).",
     )
     p.add_argument("--enemy-backend-mod", default="enemy_nn_backend_mod.pk3", help="Enemy backend mod path")
     p.add_argument("--enemy-slots", type=int, default=16, help="Enemy slots")
@@ -67,8 +69,6 @@ def _parse_maps(args: argparse.Namespace) -> list[str]:
         maps = [m.strip() for m in raw.split(",") if m.strip()]
         if maps:
             return maps
-    if args.release_gate:
-        return ["E1M1", "E1M2", "E1M3"]
     return [args.map]
 
 
@@ -95,9 +95,32 @@ def _parse_tick_suites(args: argparse.Namespace) -> list[int]:
             suites.append(max(1, int(token)))
         if suites:
             return suites
-    if args.release_gate:
-        return [5000, 20000]
     return [max(1, int(args.max_ticks))]
+
+
+def _enforce_release_suite(
+    maps: list[str],
+    seeds: list[int],
+    tick_suites: list[int],
+    quick: bool,
+) -> tuple[list[str], list[int], list[int]]:
+    if quick:
+        return maps, seeds, tick_suites
+
+    required_maps = ["E1M1", "E1M2", "E1M3"]
+    map_set = set(maps)
+    map_set.update(required_maps)
+    ordered_maps = [m for m in required_maps if m in map_set]
+    ordered_maps.extend(sorted(m for m in map_set if m not in set(required_maps)))
+
+    seed_set = set(seeds)
+    seed_set.update({1, 2, 3})
+    ordered_seeds = sorted(seed_set)
+
+    tick_set = set(max(1, int(t)) for t in tick_suites)
+    tick_set.update({5000, 20000})
+    ordered_ticks = sorted(tick_set)
+    return ordered_maps, ordered_seeds, ordered_ticks
 
 
 def _evaluate_case(args: argparse.Namespace, map_name: str, seed: int, ticks: int) -> tuple[list[str], int]:
@@ -201,6 +224,16 @@ def main() -> int:
     maps = _parse_maps(args)
     seeds = _parse_seeds(args.seeds)
     tick_suites = _parse_tick_suites(args)
+    maps, seeds, tick_suites = _enforce_release_suite(maps, seeds, tick_suites, quick=bool(args.quick))
+
+    if args.quick:
+        print("Quick mode: running only requested cases.")
+    else:
+        print(
+            "Release gate enforced: "
+            f"maps={','.join(maps)} seeds={','.join(str(s) for s in seeds)} "
+            f"tick_suites={','.join(str(t) for t in tick_suites)}"
+        )
 
     all_failures: list[str] = []
     case_count = 0
