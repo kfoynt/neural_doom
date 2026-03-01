@@ -687,7 +687,6 @@ class DoomTransformerLoop:
         )
         self._enemy_target_lock_index = np.zeros(self.config.enemy_slots, dtype=np.int32)
         self._enemy_target_retarget_cooldown_left = np.zeros(self.config.enemy_slots, dtype=np.int32)
-        self._enemy_target_threat_age = np.zeros(self.config.enemy_slots, dtype=np.float32)
         self._latest_target_mask = np.zeros(self.enemy_target_mask_dim, dtype=np.float32)
         if self.enemy_target_mask_dim > 0:
             self._latest_target_mask[0] = 100.0
@@ -1038,7 +1037,6 @@ class DoomTransformerLoop:
         self._enemy_memory[slot, :] = 0.0
         self._enemy_target_lock_index[slot] = 0
         self._enemy_target_retarget_cooldown_left[slot] = 0
-        self._enemy_target_threat_age[slot] = 0.0
         self._last_enemy_cmds[slot]["speed"] = -1
         self._last_enemy_cmds[slot]["fwd"] = -999
         self._last_enemy_cmds[slot]["side"] = -999
@@ -1083,15 +1081,15 @@ class DoomTransformerLoop:
 
     def _decode_enemy_target_memory_state(self, slot: int) -> tuple[float, int, float, float]:
         if slot < 0 or slot >= self.config.enemy_slots:
-            return 0.0, 1, 0.90, 0.0
+            return 0.0, 1, 0.0, 0.0
         memory = self._enemy_memory[slot]
         if memory.shape[0] < 8:
-            return 0.0, 1, 0.90, 0.0
+            return 0.0, 1, 0.0, 0.0
         lock_strength = float(np.clip(0.5 + 0.5 * float(memory[4]), 0.0, 1.0))
         retarget_cooldown = int(np.clip(round(1.0 + 48.0 * (0.5 + 0.5 * float(memory[5]))), 1, 49))
-        threat_decay = float(np.clip(0.70 + 0.28 * (0.5 + 0.5 * float(memory[6])), 0.70, 0.98))
+        switch_bias = float(np.clip(float(memory[6]), -1.0, 1.0))
         retarget_gate = float(np.clip(0.5 + 0.5 * float(memory[7]), 0.0, 1.0))
-        return lock_strength, retarget_cooldown, threat_decay, retarget_gate
+        return lock_strength, retarget_cooldown, switch_bias, retarget_gate
 
     def _decode_enemy_fire_memory_state(self, slot: int) -> tuple[float, float, float, float]:
         if slot < 0 or slot >= self.config.enemy_slots:
@@ -1578,18 +1576,18 @@ class DoomTransformerLoop:
                 fire_mix_cmd = float(np.clip(0.5 + 0.5 * drive[15], 0.0, 1.0))
                 retreat_mix_cmd = float(np.clip(0.5 + 0.5 * drive[16], 0.0, 1.0))
                 health_cmd_norm = float(0.5 + 0.5 * drive[17])
-                target_index_cmd_norm = float(0.5 + 0.5 * drive[18])
+                _target_index_cmd_norm = float(0.5 + 0.5 * drive[18])
                 fwd_final_cmd = float(drive[19])
                 side_final_cmd = float(drive[20])
                 turn_final_cmd = float(drive[21])
                 aim_final_logit = float(drive[22])
                 fire_final_logit = float(drive[23])
-                target_blend_gate = float(np.clip(0.5 + 0.5 * drive[24], 0.0, 1.0))
+                _target_blend_gate = float(np.clip(0.5 + 0.5 * drive[24], 0.0, 1.0))
                 fire_enable_logit = float(drive[25])
                 burst_len_norm = float(0.5 + 0.5 * drive[26])
                 inter_shot_delay_norm = float(0.5 + 0.5 * drive[27])
                 reaction_delay_norm = float(0.5 + 0.5 * drive[28])
-                coord_focus_target_index_norm = float(0.5 + 0.5 * drive[29])
+                _coord_focus_target_index_norm = float(0.5 + 0.5 * drive[29])
                 coord_assist_gate = float(np.clip(0.5 + 0.5 * drive[30], 0.0, 1.0))
                 coord_spacing_cmd = float(drive[31])
                 coord_avoidance_cmd = float(drive[32])
@@ -1623,48 +1621,16 @@ class DoomTransformerLoop:
                 if not bool(np.any(valid_targets)):
                     valid_targets[0] = True
                 masked_target_scores = np.where(valid_targets, target_scores, -1e9)
-                logits_index = int(np.argmax(masked_target_scores))
-                if masked_target_scores[logits_index] <= -1e8:
-                    logits_index = 0
+                proposal_index = int(np.argmax(masked_target_scores))
+                if masked_target_scores[proposal_index] <= -1e8:
+                    proposal_index = 0
 
-                direct_index = int(
-                    np.clip(
-                        round(float(np.clip(target_index_cmd_norm, 0.0, 1.0)) * float(self.enemy_target_dim - 1)),
-                        0,
-                        self.enemy_target_dim - 1,
-                    )
-                )
-                if masked_target_scores[direct_index] <= -1e8:
-                    direct_index = logits_index
-                mixed_index = (1.0 - target_blend_gate) * float(logits_index) + target_blend_gate * float(direct_index)
-                proposal_index = int(np.clip(round(mixed_index), 0, self.enemy_target_dim - 1))
-                if not bool(valid_targets[proposal_index]):
-                    proposal_index = logits_index if bool(valid_targets[logits_index]) else 0
-                focus_index = int(
-                    np.clip(
-                        round(float(np.clip(coord_focus_target_index_norm, 0.0, 1.0)) * float(self.enemy_target_dim - 1)),
-                        0,
-                        self.enemy_target_dim - 1,
-                    )
-                )
-                if not bool(valid_targets[focus_index]):
-                    focus_index = logits_index if bool(valid_targets[logits_index]) else 0
-                proposal_index = int(
-                    np.clip(
-                        round((1.0 - coord_assist_gate) * float(proposal_index) + coord_assist_gate * float(focus_index)),
-                        0,
-                        self.enemy_target_dim - 1,
-                    )
-                )
-                if not bool(valid_targets[proposal_index]):
-                    proposal_index = logits_index if bool(valid_targets[logits_index]) else 0
-
-                # Memory-authored target persistence: lock strength, retarget cooldown,
-                # and threat-age decay come from memory channels [4:8].
+                # Target selection authority: Transformer target logits + memory[4:8].
+                # Python keeps only hard validity masking and numeric clipping.
                 (
                     lock_strength,
                     retarget_cooldown_tics,
-                    threat_decay,
+                    switch_bias,
                     retarget_gate,
                 ) = self._decode_enemy_target_memory_state(slot)
                 if self._enemy_target_retarget_cooldown_left[slot] > 0:
@@ -1676,22 +1642,17 @@ class DoomTransformerLoop:
                 if not bool(valid_targets[current_lock]):
                     current_lock = 0
 
-                threat_age = float(np.clip(self._enemy_target_threat_age[slot], 0.0, 1.0))
-                if proposal_index == current_lock:
-                    threat_age *= threat_decay
-                else:
-                    threat_age = min(1.0, threat_age * threat_decay + (1.0 - threat_decay))
-
-                switch_score = retarget_gate + threat_age - lock_strength
+                proposal_score = float(masked_target_scores[proposal_index]) if bool(valid_targets[proposal_index]) else -1e9
+                current_score = float(masked_target_scores[current_lock]) if bool(valid_targets[current_lock]) else -1e9
+                score_margin = float(np.tanh(0.25 * (proposal_score - current_score)))
+                switch_score = score_margin + switch_bias + retarget_gate - lock_strength
                 can_switch = self._enemy_target_retarget_cooldown_left[slot] <= 0
                 if can_switch and bool(valid_targets[proposal_index]) and proposal_index != current_lock and switch_score > 0.0:
                     current_lock = proposal_index
                     self._enemy_target_retarget_cooldown_left[slot] = retarget_cooldown_tics
-                    threat_age = 0.0
 
                 selected_index = current_lock
                 self._enemy_target_lock_index[slot] = int(selected_index)
-                self._enemy_target_threat_age[slot] = float(np.clip(threat_age, 0.0, 1.0))
 
                 # Helper is strict index->coordinate mapping + invalid-index clamp.
                 _target_x, _target_y, _target_index = self._select_enemy_target_point(
@@ -1844,35 +1805,33 @@ class DoomTransformerLoop:
                     fire_cadence_phase,
                     fire_reaction_phase,
                 ) = self._decode_enemy_fire_memory_state(slot)
-                burst_len = int(
-                    np.clip(round(1.0 + 7.0 * (0.55 * burst_len_norm + 0.45 * fire_burst_phase)), 1, 8)
+                # Fire arbitration is direct NN decode:
+                # fire-policy logits + memory phases, with no local startup/threshold branches.
+                burst_mix = float(np.clip(0.55 * burst_len_norm + 0.45 * fire_burst_phase, 0.0, 1.0))
+                cadence_mix = float(np.clip(0.55 * inter_shot_delay_norm + 0.45 * fire_cadence_phase, 0.0, 1.0))
+                reaction_mix = float(np.clip(0.55 * reaction_delay_norm + 0.45 * fire_reaction_phase, 0.0, 1.0))
+                fire_temporal_gate = float(
+                    np.clip(
+                        0.42 * fire_ready_phase
+                        + 0.28 * burst_mix
+                        + 0.22 * (1.0 - cadence_mix)
+                        + 0.08 * (1.0 - reaction_mix),
+                        0.0,
+                        1.0,
+                    )
                 )
-                inter_shot_delay = int(
-                    np.clip(round(2.0 + 22.0 * (0.55 * inter_shot_delay_norm + 0.45 * fire_cadence_phase)), 2, 24)
+                fire_policy_score = float(
+                    np.clip(
+                        fire_intent_strength
+                        + 0.48 * (fire_temporal_gate - 0.5)
+                        + 0.14 * np.tanh(1.6 * fire_enable_logit),
+                        -2.0,
+                        2.0,
+                    )
                 )
-                reaction_delay = int(
-                    np.clip(round(12.0 * (0.55 * reaction_delay_norm + 0.45 * fire_reaction_phase)), 0, 12)
-                )
-                prev_fire = bool(self._enemy_last_cmd[slot, 5] > 0.5)
+                fire = 1 if (fire_enable and aim and fire_policy_score > 0.0) else 0
 
-                # Fire temporal state is memory-authored: no local burst/reaction counters.
-                temporal_ready = (
-                    0.45 * fire_ready_phase
-                    + 0.35 * fire_burst_phase
-                    + 0.20 * (1.0 - fire_cadence_phase)
-                )
-                temporal_block = 0.35 * fire_reaction_phase
-                base_fire_score = float(fire_intent_strength) + (temporal_ready - temporal_block - 0.25)
-                if prev_fire:
-                    fire_score = base_fire_score + 0.18 * (0.5 + 0.5 * fire_burst_phase)
-                    threshold = -0.05 + 0.20 * (1.0 - float(np.clip(burst_len / 8.0, 0.0, 1.0)))
-                else:
-                    startup_penalty = 0.08 + 0.35 * float(np.clip(reaction_delay / 12.0, 0.0, 1.0))
-                    fire_score = base_fire_score - startup_penalty
-                    threshold = 0.05
-                fire = 1 if (fire_enable and aim and fire_score > threshold) else 0
-
-                cadence_firecd = inter_shot_delay
+                cadence_firecd = int(np.clip(round(2.0 + 22.0 * cadence_mix), 2, 24))
                 if cadence_firecd != self._last_enemy_cmds[slot]["firecd"]:
                     self.game.send_game_command(f"set nn_enemy_cmd_{slot:02d}_firecd {cadence_firecd}")
                     self._last_enemy_cmds[slot]["firecd"] = cadence_firecd
@@ -1905,7 +1864,6 @@ class DoomTransformerLoop:
                 self._enemy_memory[slot, :] = 0.0
                 self._enemy_target_lock_index[slot] = 0
                 self._enemy_target_retarget_cooldown_left[slot] = 0
-                self._enemy_target_threat_age[slot] = 0.0
                 healthpct = 100
             commands.append((speed, fwd, side, turn, aim, fire))
             self._enemy_last_cmd[slot, 0] = float(speed)
@@ -2294,11 +2252,15 @@ class DoomTransformerLoop:
         )
         print(
             "Enemy target persistence source: memory[4:8] => "
-            "lock_strength/retarget_cooldown/threat_age_decay/retarget_gate"
+            "lock_strength/retarget_cooldown/switch_bias/retarget_gate"
         )
         print(
             "Enemy fire temporal source: memory[4:8] => "
             "ready/burst/cadence/reaction phases (counter-free)"
+        )
+        print(
+            "Enemy fire arbitration source: direct NN policy logits + memory phases; "
+            "no local startup/threshold heuristics"
         )
         print(
             "Enemy nav-intent channels active: "
