@@ -736,6 +736,7 @@ class DoomTransformerLoop:
         self._enemy_prev_health_obs = np.full(self.config.enemy_slots, np.nan, dtype=np.float32)
         self._enemy_recent_damage = np.zeros(self.config.enemy_slots, dtype=np.float32)
         self._enemy_last_cmd = np.zeros((self.config.enemy_slots, 6), dtype=np.float32)
+        self._enemy_last_target_index = np.full(self.config.enemy_slots, -1, dtype=np.int32)
         self._enemy_memory = np.zeros(
             (self.config.enemy_slots, self.enemy_memory_feature_dim),
             dtype=np.float32,
@@ -787,6 +788,7 @@ class DoomTransformerLoop:
         self.history: Deque[np.ndarray] = deque(maxlen=self.config.context)
         self.last_position: tuple[float, float] | None = None
         self.stuck_ticks = 0
+        self._player_max_stuck_ticks = 0
         self._last_sampled_keys = np.zeros(len(self.keyboard_buttons), dtype=np.float32)
         self._stale_key_ticks = 0
         self._attack_cooldown_left = 0
@@ -1122,6 +1124,7 @@ class DoomTransformerLoop:
         self._enemy_prev_health_obs[slot] = np.nan
         self._enemy_recent_damage[slot] = 0.0
         self._enemy_last_cmd[slot, :] = 0.0
+        self._enemy_last_target_index[slot] = -1
         self._enemy_memory[slot, :] = 0.0
         self._last_enemy_cmds[slot]["speed"] = -1
         self._last_enemy_cmds[slot]["fwd"] = -999
@@ -1601,7 +1604,8 @@ class DoomTransformerLoop:
                 act_inter_shot_delay_norm = float(np.clip(0.5 + 0.5 * actuator_drive[19], 0.0, 1.0))
                 act_reaction_delay_norm = float(np.clip(0.5 + 0.5 * actuator_drive[20], 0.0, 1.0))
 
-                # Target selection is fully NN-owned: direct index + keep/switch gates.
+                # Target persistence/retarget policy is model-owned via memory channel target_identity_norm.
+                # Python only clamps invalid targets for safety.
                 target_mask = np.asarray(self._latest_target_mask, dtype=np.float32).reshape(-1)
                 if target_mask.size < self.enemy_target_dim:
                     padded_mask = np.zeros(self.enemy_target_dim, dtype=np.float32)
@@ -1616,110 +1620,58 @@ class DoomTransformerLoop:
                 if not bool(np.any(valid_targets)):
                     valid_targets[0] = True
 
-                direct_index = int(
-                    np.clip(
-                        round(act_target_index_norm * float(max(1, self.enemy_target_dim - 1))),
-                        0,
-                        self.enemy_target_dim - 1,
-                    )
-                )
-                # Persistent target identity is read from model-owned memory channel.
+                _ = (act_target_index_norm, act_target_keep_gate, act_target_switch_gate)
                 target_mem_norm = float(np.clip(0.5 + 0.5 * float(self._enemy_memory[slot, 8]), 0.0, 1.0))
-                memory_index = int(
+                selected_index = int(
                     np.clip(
                         round(target_mem_norm * float(max(1, self.enemy_target_dim - 1))),
                         0,
                         self.enemy_target_dim - 1,
                     )
                 )
-                if not bool(valid_targets[memory_index]):
-                    memory_index = direct_index if bool(valid_targets[direct_index]) else int(np.argmax(valid_targets.astype(np.int32)))
-                selected_index = memory_index if act_target_keep_gate >= act_target_switch_gate else direct_index
                 if not bool(valid_targets[selected_index]):
-                    selected_index = direct_index if bool(valid_targets[direct_index]) else int(np.argmax(valid_targets.astype(np.int32)))
-                target_switched = selected_index != memory_index
-                if target_switched:
+                    selected_index = 0
+                last_target = int(self._enemy_last_target_index[slot])
+                if last_target >= 0 and selected_index != last_target:
                     target_switches_tick += 1
+                self._enemy_last_target_index[slot] = selected_index
 
-                target_x, target_y, _target_index = self._select_enemy_target_point(
-                    slot_enemies,
-                    player_x,
-                    player_y,
-                    selected_index,
-                )
-                _ = (target_x, target_y, _target_index)
+                _ = (player_x, player_y, selected_index)
 
-                # Movement resolution comes from explicit actuator movement channels.
-                if self.config.nn_world_sim and self._world_sim_initialized:
-                    enemy_x = float(self._world_enemies[slot, 0])
-                    enemy_y = float(self._world_enemies[slot, 1])
-                    angle_rad = np.deg2rad(float(self._world_enemies[slot, 2]))
-                else:
-                    enemy_x = float(enemy.position_x)
-                    enemy_y = float(enemy.position_y)
-                    angle_rad = np.deg2rad(float(enemy.angle))
-                cos_a = float(np.cos(angle_rad))
-                sin_a = float(np.sin(angle_rad))
-                move_local_fwd = float(cos_a * act_move_dx_cmd + sin_a * act_move_dy_cmd)
-                move_local_side = float(-sin_a * act_move_dx_cmd + cos_a * act_move_dy_cmd)
-                base_fwd = float((1.0 - act_slide_bias_norm) * act_fwd_cmd + act_slide_bias_norm * move_local_fwd)
-                base_side = float((1.0 - act_slide_bias_norm) * act_side_cmd + act_slide_bias_norm * move_local_side)
-                # Movement is now direct actuator decode; no Python-built separation vector.
-                move_gain = float(0.75 + 0.25 * act_separation_gain_norm)
-                fwd_drive = float(np.clip(base_fwd * move_gain, -1.0, 1.0))
-                side_drive = float(np.clip(base_side * move_gain, -1.0, 1.0))
-
-                # Turn can be driven by explicit turn command and movement vector heading.
-                if abs(move_local_fwd) > 1e-4 or abs(move_local_side) > 1e-4:
-                    turn_from_move = float(
-                        np.clip(
-                            np.arctan2(move_local_side, move_local_fwd) / (0.5 * np.pi),
-                            -1.0,
-                            1.0,
-                        )
-                    )
-                else:
-                    turn_from_move = 0.0
-                turn_drive = float(np.clip((1.0 - act_slide_bias_norm) * act_turn_cmd + act_slide_bias_norm * turn_from_move, -1.0, 1.0))
-
-                speed_norm = float(np.clip(act_speed_norm * (1.0 - 0.10 * act_separation_gain_norm), 0.0, 1.0))
-                speed = int(np.clip(round(35.0 + 195.0 * speed_norm), 35, 230))
-                fwd = int(np.clip(round(100.0 * fwd_drive), -100, 100))
-                side = int(np.clip(round(100.0 * side_drive), -100, 100))
-                turn = int(np.clip(round(120.0 * turn_drive), -120, 120))
+                # Model-authoritative decode: direct actuator movement channels only.
+                _ = (act_move_dx_cmd, act_move_dy_cmd, act_slide_bias_norm, act_separation_gain_norm)
+                speed = int(np.clip(round(35.0 + 195.0 * act_speed_norm), 35, 230))
+                fwd = int(np.clip(round(100.0 * act_fwd_cmd), -100, 100))
+                side = int(np.clip(round(100.0 * act_side_cmd), -100, 100))
+                turn = int(np.clip(round(120.0 * act_turn_cmd), -120, 120))
                 motion_norm = float(np.hypot(float(fwd), float(side)))
                 if motion_norm > 100.0 and motion_norm > 1e-5:
                     scale = 100.0 / motion_norm
                     fwd = int(np.clip(round(fwd * scale), -100, 100))
                     side = int(np.clip(round(side * scale), -100, 100))
-                if abs(fwd) < 3:
-                    fwd = 0
-                if abs(side) < 3:
-                    side = 0
-                if abs(turn) < 2:
-                    turn = 0
 
-                # Combat timing is fully NN-authored from explicit timing channels.
+                # Fire policy is model-authored: direct logits + model memory phase channels.
                 aim_score = float(np.clip(act_aim_logit - act_aim_gate_logit, -2.0, 2.0))
                 fire_score = float(np.clip(act_fire_logit - act_fire_gate_logit, -2.0, 2.0))
                 aim = 1 if aim_score > 0.0 else 0
                 fire_enable = bool(act_fire_enable_logit > 0.0)
-                fire_intent = bool(fire_enable and aim == 1 and fire_score > 0.0)
-                burst_len = int(np.clip(round(1.0 + 7.0 * act_burst_len_norm), 1, 8))
-                inter_shot_delay = int(np.clip(round(2.0 + 22.0 * act_inter_shot_delay_norm), 2, 24))
-                reaction_delay = int(np.clip(round(12.0 * act_reaction_delay_norm), 0, 12))
-                # Timing phases are model-owned memory channels (no Python counters).
-                fire_mem_reaction = float(np.clip(0.5 + 0.5 * float(self._enemy_memory[slot, 1]), 0.0, 1.0))
-                fire_mem_intershot = float(np.clip(0.5 + 0.5 * float(self._enemy_memory[slot, 2]), 0.0, 1.0))
-                fire_mem_burst = float(np.clip(0.5 + 0.5 * float(self._enemy_memory[slot, 3]), 0.0, 1.0))
-                reaction_ready = fire_mem_reaction >= (reaction_delay / 12.0 if reaction_delay > 0 else 0.0)
-                intershot_ready = fire_mem_intershot >= (inter_shot_delay / 24.0)
-                burst_ready = fire_mem_burst >= (1.0 - float(np.clip((burst_len - 1) / 7.0, 0.0, 1.0)))
-                fire = 1 if (fire_intent and reaction_ready and intershot_ready and burst_ready) else 0
+                fire_phase = float(np.clip(float(self._enemy_memory[slot, 3]), -1.0, 1.0))
+                timing_bias = float(
+                    np.clip(
+                        ((2.0 * act_burst_len_norm - 1.0) + (2.0 * act_inter_shot_delay_norm - 1.0) + (2.0 * act_reaction_delay_norm - 1.0))
+                        / 3.0,
+                        -1.0,
+                        1.0,
+                    )
+                )
+                fire_policy_score = float(np.clip(fire_score + fire_phase + 0.25 * timing_bias, -4.0, 4.0))
+                fire = 1 if (fire_enable and aim == 1 and fire_policy_score > 0.0) else 0
                 if fire:
                     shots_tick += 1
 
-                cadence_firecd = inter_shot_delay
+                mem_cadence_norm = float(np.clip(0.5 + 0.5 * float(self._enemy_memory[slot, 2]), 0.0, 1.0))
+                cadence_norm = float(np.clip(0.6 * act_firecd_norm + 0.4 * mem_cadence_norm, 0.0, 1.0))
+                cadence_firecd = int(np.clip(round(2.0 + 22.0 * cadence_norm), 2, 24))
                 if cadence_firecd != self._last_enemy_cmds[slot]["firecd"]:
                     self.game.send_game_command(f"set nn_enemy_cmd_{slot:02d}_firecd {cadence_firecd}")
                     self._last_enemy_cmds[slot]["firecd"] = cadence_firecd
@@ -1741,6 +1693,7 @@ class DoomTransformerLoop:
                 aim = 0
                 fire = 0
                 self._enemy_memory[slot, :] = 0.0
+                self._enemy_last_target_index[slot] = -1
                 healthpct = 100
             commands.append((speed, fwd, side, turn, aim, fire))
             self._enemy_last_cmd[slot, 0] = float(speed)
@@ -2061,6 +2014,8 @@ class DoomTransformerLoop:
         self._enemy_metric_target_switches = 0
         self._enemy_metric_active_enemy_ticks = 0
         self._enemy_metric_close_pairs = 0
+        self._player_max_stuck_ticks = 0
+        self.stuck_ticks = 0
         for slot in range(self.config.enemy_slots):
             self._reset_enemy_slot_runtime(slot)
         initial_keyboard = self._read_keyboard_state()
@@ -2095,6 +2050,8 @@ class DoomTransformerLoop:
         else:
             self.stuck_ticks = 0
 
+        if self.stuck_ticks > self._player_max_stuck_ticks:
+            self._player_max_stuck_ticks = self.stuck_ticks
         self.last_position = position
 
     def _decode_controls(
@@ -2364,31 +2321,30 @@ class DoomTransformerLoop:
             f"{'/'.join(self.enemy_intent_names)} + intent_timer_norm (not in final actuator path)"
         )
         print(
-            "Enemy target source: direct actuator target-index + keep/switch gates; "
+            "Enemy target source: model memory target_identity_norm; "
             "Python only applies hard validity clamps"
         )
         print(
-            "Enemy fire timing source: direct actuator channels => "
-            "fire_enable/burst_len/inter_shot_delay/reaction_delay"
+            "Enemy fire timing source: model memory phase + actuator timing channels "
+            "(no Python counters/rule thresholds)"
         )
         print(
-            "Enemy fire state machine source: model memory channels (no Python fire counters)"
+            "Enemy fire state machine source: model memory channels"
         )
         print(
-            "Enemy fire source: direct actuator logits + direct actuator fire-gate logit"
+            "Enemy fire source: direct actuator logits + fire-enable gate + memory-phase bias"
         )
         print(
-            "Enemy fire cadence source: direct actuator inter_shot_delay channel"
+            "Enemy fire cadence source: direct actuator firecd + memory cadence phase"
         )
         print(
             "Enemy aim source: direct actuator aim logit + direct actuator aim-gate logit"
         )
         print(
-            "Enemy movement-resolution source: direct actuator move_dx/move_dy/slide_bias/separation_gain"
+            "Enemy steering source: direct actuator speed/fwd/side/turn channels"
         )
         print(
-            "Enemy steering source: direct NN channels "
-            "(final actuator head); "
+            "Enemy command decode source: direct NN actuator channels; "
             "Python applies hard command clamps only"
         )
         print(
@@ -2497,7 +2453,8 @@ class DoomTransformerLoop:
                     f"shots_per_tick={shots_per_tick:.3f} "
                     f"target_switches_per_tick={switches_per_tick:.3f} "
                     f"target_switches_per_enemy_tick={switches_per_enemy_tick:.4f} "
-                    f"close_pairs_per_tick={close_pairs_per_tick:.3f}"
+                    f"close_pairs_per_tick={close_pairs_per_tick:.3f} "
+                    f"player_max_stuck_ticks={self._player_max_stuck_ticks}"
                 )
             self.game.close()
             print("Session closed.")

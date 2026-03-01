@@ -68,21 +68,20 @@ python3 run_enemy_regression.py --wad DOOM.WAD --enemy-backend-mod enemy_nn_back
   - `control_logits` (decoded into Doom control actions).
   - `enemy_logits` (legacy diagnostic head; not used in final enemy actuation path).
   - `enemy_intent_logits` (legacy diagnostic head; not used in final enemy actuation path).
-  - `enemy_actuator_logits` (per-slot final actuator commands: movement/turn/aim/fire/firecd/health plus movement-resolution, target-select, and combat-timing channels).
+  - `enemy_actuator_logits` (per-slot final actuator commands: movement/turn/aim/fire/firecd/health plus auxiliary movement/target/timing channels).
   - `low_level_logits` (non-standard backend knobs for player dynamics).
   - `memory_update_logits` (per-slot memory update channels: gate + delta for persistent enemy latent state).
 - The player action sent to Doom is computed from Transformer logits each tick (keyboard-gated, NN-modulated strength/conflict resolution).
 - In `--enemy-backend-transformer` mode, the loop also sends per-slot enemy commands to a custom mod (`enemy_nn_backend_mod.pk3`) each tick:
   - Transformer behavior channels are decoded into backend actuation:
     - behavior channels: 38 core channels (`speed_cmd`, `advance_cmd`, `strafe_cmd`, `turn_cmd`, `aim_cmd_logit`, `fire_cmd_logit`, `advance_conf`, `strafe_conf`, `turn_conf`, `aim_conf`, `fire_conf`, `move_mix_cmd`, `strafe_mix_cmd`, `turn_mix_cmd`, `aim_mix_cmd`, `fire_mix_cmd`, `retreat_mix_cmd`, `health_cmd_norm`, `target_index_cmd_norm`, `fwd_final_cmd`, `side_final_cmd`, `turn_final_cmd`, `aim_final_logit`, `fire_final_logit`, `target_blend_logit`, `fire_enable_logit`, `burst_len_norm`, `inter_shot_delay_norm`, `reaction_delay_norm`, `coord_focus_target_index_norm`, `coord_assist_gate_logit`, `coord_spacing_cmd`, `coord_avoidance_cmd`, `nav_desired_heading_cmd`, `nav_desired_speed_norm`, `nav_cover_seek_cmd`, `nav_retreat_seek_cmd`, `firecd_cmd_norm`) plus target-selection logits (`target_player_logit`, `target_slot_00_logit` ... `target_slot_15_logit`)
-    - per-slot target decode is fully actuator-side from `act_target_index_norm` + `act_target_keep_gate_logit` + `act_target_switch_gate_logit`; Python only applies hard validity clamps
-    - final backend actuation is fully direct from the final actuator head (movement/turn/aim/fire/firecd/health + movement-resolution channels); Python only applies hard command clamps
+    - per-slot target selection is model-memory-driven from `target_identity_norm`; Python only applies hard validity clamps
+    - final backend actuation is fully direct from final actuator channels (`speed/fwd/side/turn/aim/fire/firecd/health`); Python only applies hard command clamps
     - actuation channels sent to Doom/mod: `speed`, `fwd`, `side`, `turn`, `aim`, `fire`
-  - aiming/firing and timing are driven by explicit actuator channels:
+  - aiming/firing and timing are driven by actuator channels with model-memory phase state:
     - `act_aim_logit` vs `act_aim_gate_logit` -> backend `aim` decision
-    - `act_fire_logit` vs `act_fire_gate_logit` -> backend `fire` decision
-    - `act_fire_enable_logit` + `act_burst_len_norm` + `act_inter_shot_delay_norm` + `act_reaction_delay_norm` -> backend fire-state timing
-    - `act_inter_shot_delay_norm` -> backend `nn_enemy_cmd_*_firecd`
+    - `act_fire_logit` vs `act_fire_gate_logit`, gated by `act_fire_enable_logit` and memory phase -> backend `fire` decision
+    - `act_firecd_norm` blended with memory cadence phase -> backend `nn_enemy_cmd_*_firecd`
   - enemy health (`nn_enemy_cmd_*_healthpct`) is driven directly from `act_health_norm`
   - enemy intent head (`chase/flank/retreat/hold` + timer) is currently emitted as model context/diagnostics (not in final actuator path)
 - Per-enemy memory state is maintained in-loop as a persistent latent (`10` values/slot), updated each tick only by Transformer memory-update outputs (gate + delta), and fed back into `state_in`.
@@ -176,12 +175,12 @@ Per tick, one `state_in` vector is built and then stacked over time (`context=32
   - control logits (decoded to Doom buttons)
   - enemy logits (legacy diagnostics)
   - enemy intent logits (legacy diagnostics)
-  - enemy actuator logits (decoded per slot: final movement/turn/aim/fire/firecd/health + movement-resolution + target-select + combat-timing channels)
+  - enemy actuator logits (decoded per slot: final movement/turn/aim/fire/firecd/health + auxiliary target/timing channels)
   - low-level logits (decoded to non-standard player dynamics)
 - Player control is keyboard-gated but now NN-modulated each tick: control logits scale movement/turn strength, and still resolve opposing-key conflicts.
 - Experimental enemy-backend mode:
   - Build mod with `python3 build_enemy_nn_mod.py`.
   - Enable with `--enemy-backend-transformer --enemy-backend-mod enemy_nn_backend_mod.pk3`.
-  - Current implementation applies per-slot monster movement/pathing/aiming/firing control commands from Transformer outputs, with direct actuator target decode (`act_target_index_norm` + keep/switch gates), direct actuator movement resolution (`act_move_dx_cmd/act_move_dy_cmd/act_slide_bias_norm/act_separation_gain_norm`), and direct actuator combat timing (`act_fire_enable_logit/act_burst_len_norm/act_inter_shot_delay_norm/act_reaction_delay_norm`), with only hard command/validity clamps outside.
-  - Target mapping helper is strict index->coordinate lookup with invalid-index clamp only.
-  - Headless runs print regression metrics summary (`shots_per_tick`, `target_switches`, `close_pairs_per_tick`) at session end.
+  - Current implementation applies per-slot monster movement/pathing/aiming/firing commands from Transformer outputs, with model-memory target identity (`target_identity_norm`), direct actuator command decode (`speed/fwd/side/turn/aim/fire/firecd/health`), and only hard command/validity clamps outside.
+  - Fire gating/timing is model-driven (actuator logits + memory-phase channels), without Python fire counters/rule thresholds.
+  - Headless runs print regression metrics summary (`shots_per_tick`, `target_switches`, `close_pairs_per_tick`, `player_max_stuck_ticks`) at session end.

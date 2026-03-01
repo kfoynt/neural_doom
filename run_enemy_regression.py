@@ -16,7 +16,8 @@ METRIC_RE = re.compile(
     r"shots_per_tick=(?P<shots>[0-9.]+)\s+"
     r"target_switches_per_tick=(?P<switch_tick>[0-9.]+)\s+"
     r"target_switches_per_enemy_tick=(?P<switch_enemy>[0-9.]+)\s+"
-    r"close_pairs_per_tick=(?P<close_pairs>[0-9.]+)"
+    r"close_pairs_per_tick=(?P<close_pairs>[0-9.]+)\s+"
+    r"player_max_stuck_ticks=(?P<stuck>\d+)"
 )
 
 
@@ -33,6 +34,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-close-pairs-per-tick", type=float, default=4.0)
     p.add_argument("--max-target-switches-per-enemy-tick", type=float, default=0.20)
     p.add_argument("--min-shots-per-tick", type=float, default=0.0)
+    p.add_argument("--max-shots-per-tick", type=float, default=1.25)
+    p.add_argument("--max-player-stuck-ticks", type=int, default=96)
     return p.parse_args()
 
 
@@ -74,11 +77,16 @@ def main() -> int:
     shots_per_tick = float(match.group("shots"))
     switches_per_enemy_tick = float(match.group("switch_enemy"))
     close_pairs_per_tick = float(match.group("close_pairs"))
+    player_max_stuck_ticks = int(match.group("stuck"))
 
     failures: list[str] = []
     if shots_per_tick < args.min_shots_per_tick:
         failures.append(
             f"shots_per_tick {shots_per_tick:.3f} < min_shots_per_tick {args.min_shots_per_tick:.3f}"
+        )
+    if shots_per_tick > args.max_shots_per_tick:
+        failures.append(
+            f"shots_per_tick {shots_per_tick:.3f} > max_shots_per_tick {args.max_shots_per_tick:.3f}"
         )
     if switches_per_enemy_tick > args.max_target_switches_per_enemy_tick:
         failures.append(
@@ -90,12 +98,17 @@ def main() -> int:
         failures.append(
             f"close_pairs_per_tick {close_pairs_per_tick:.3f} > max_close_pairs_per_tick {args.max_close_pairs_per_tick:.3f}"
         )
+    if player_max_stuck_ticks > args.max_player_stuck_ticks:
+        failures.append(
+            f"player_max_stuck_ticks {player_max_stuck_ticks} > max_player_stuck_ticks {args.max_player_stuck_ticks}"
+        )
 
     print(
         "Parsed metrics: "
         f"ticks={ticks} shots_per_tick={shots_per_tick:.3f} "
         f"target_switches_per_enemy_tick={switches_per_enemy_tick:.4f} "
-        f"close_pairs_per_tick={close_pairs_per_tick:.3f}"
+        f"close_pairs_per_tick={close_pairs_per_tick:.3f} "
+        f"player_max_stuck_ticks={player_max_stuck_ticks}"
     )
 
     if failures:
