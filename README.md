@@ -61,14 +61,19 @@ python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-
   - `state_out` (predicted next backend state vector).
   - `control_logits` (decoded into Doom control actions).
   - `enemy_logits` (per-slot enemy backend command logits when enemy backend mode is enabled).
-  - `low_level_logits` (non-standard backend knobs for player dynamics and enemy low-level channels).
+  - `low_level_logits` (non-standard backend knobs for player dynamics, plus enemy firecd proxy diagnostics).
 - The player action sent to Doom is computed from Transformer logits each tick (keyboard-gated, NN-modulated strength/conflict resolution).
 - In `--enemy-backend-transformer` mode, the loop also sends per-slot enemy commands to a custom mod (`enemy_nn_backend_mod.pk3`) each tick:
   - Transformer behavior channels are decoded into backend actuation:
-    - behavior channels: `speed_drive`, `fwd_drive`, `side_drive`, `turn_drive`, `aim_drive`, `fire_drive`, `desired_range`, `commit_fire`, `disengage`, `target_offset`, `pressure`, `flank_bias`, `fire_rate`, `burst_len`, `cooldown_intent`, `desired_aim_offset`, `aim_smoothing`, `track_aggressiveness`
+    - behavior channels: core control channels (`speed_drive`, `fwd_drive`, `side_drive`, `turn_drive`, `aim_enable_logit`, `fire_pulse_logit`, `desired_range`, `commit_fire`, `disengage`, `target_offset`, `pressure`, `flank_bias`, `cooldown_ticks_intent`, `burst_ticks_intent`, `fire_threshold_intent`, `desired_aim_offset`, `aim_smoothing`, `track_aggressiveness`, `health_intent`) plus target-selection logits (`target_player_logit`, `target_slot_00_logit` ... `target_slot_15_logit`)
+    - per-slot target logits are used each tick to select the enemy target point (player or another tracked slot)
     - actuation channels sent to Doom/mod: `speed`, `fwd`, `side`, `turn`, `aim`, `fire`
-  - fire cadence (`nn_enemy_cmd_*_firecd`) is now driven from enemy behavior channels (`fire_rate`, `burst_len`, `cooldown_intent`)
-  - low-level channels still provide `healthpct` (and a firecd proxy used for diagnostics only)
+  - aiming/firing are direct from enemy outputs:
+    - `aim_enable_logit` -> backend `aim` flag
+    - `fire_pulse_logit` + `fire_threshold_intent` -> burst trigger
+    - `cooldown_ticks_intent` + `burst_ticks_intent` -> backend fire cadence (`nn_enemy_cmd_*_firecd`, burst length)
+  - enemy health (`nn_enemy_cmd_*_healthpct`) is now driven from enemy behavior channel `health_intent`
+  - low-level channels keep a firecd proxy for diagnostics only
 - Doom remains authoritative for rendering and core simulation (physics, collisions, damage, doors/triggers, pickups, map logic).
 
 ### 2. Exact architecture and its parameters
@@ -82,8 +87,8 @@ python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-
 - Output heads:
   - `state_out_proj`: `Linear(256 -> state_dim)`.
   - `control_out_proj`: `Linear(256 -> 6)`.
-  - `enemy_out_proj`: `Linear(256 -> enemy_slots * enemy_cmd_dim)` (default `16 * 18`).
-  - `low_level_out_proj`: `Linear(256 -> low_level_dim)` where `low_level_dim = 4 + enemy_slots * 2` (default `36`).
+  - `enemy_out_proj`: `Linear(256 -> enemy_slots * enemy_cmd_dim)` (default `16 * 36`; 19 core channels + 17 target logits per slot).
+  - `low_level_out_proj`: `Linear(256 -> low_level_dim)` where `low_level_dim = 4 + enemy_slots * 1` (default `20`).
 - Context length: `32`.
 - Training: none. Weights are deterministic hardcoded at startup and frozen (`requires_grad=False`).
 
@@ -91,11 +96,11 @@ python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-
 
 - Default runtime (`1024x768`, `frame_pool=16`):
   - `state_dim = 3566`.
-  - Total parameters: `4,022,840`.
+  - Total parameters: `4,092,744`.
   - Trainable parameters: `0`.
 - At `1280x960` with `frame_pool=16`:
   - `state_dim = 5294`.
-  - Total parameters: `4,909,304`.
+  - Total parameters: `4,979,208`.
 
 ### 4. Input features
 
