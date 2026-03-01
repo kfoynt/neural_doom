@@ -631,7 +631,19 @@ class DoomTransformerLoop:
         self.enemy_intent_names = ("chase", "flank", "retreat", "hold")
         self.enemy_base_feature_dim = 24
         self.enemy_feedback_feature_dim = 11
-        self.enemy_memory_feature_dim = 8
+        self.enemy_memory_feature_dim = 10
+        self.enemy_memory_channels = (
+            "intent_chase_latent",
+            "intent_flank_latent",
+            "intent_retreat_latent",
+            "intent_hold_latent",
+            "target_lock_strength",
+            "target_retarget_ready",
+            "target_switch_bias",
+            "target_retarget_gate",
+            "target_identity_norm",
+            "engagement_phase_norm",
+        )
         self.enemy_memory_update_dim = 1 + self.enemy_memory_feature_dim
         self.enemy_feature_dim = (
             self.enemy_base_feature_dim + self.enemy_feedback_feature_dim + self.enemy_memory_feature_dim
@@ -685,8 +697,6 @@ class DoomTransformerLoop:
             (self.config.enemy_slots, self.enemy_memory_feature_dim),
             dtype=np.float32,
         )
-        self._enemy_target_lock_index = np.zeros(self.config.enemy_slots, dtype=np.int32)
-        self._enemy_target_retarget_cooldown_left = np.zeros(self.config.enemy_slots, dtype=np.int32)
         self._latest_target_mask = np.zeros(self.enemy_target_mask_dim, dtype=np.float32)
         if self.enemy_target_mask_dim > 0:
             self._latest_target_mask[0] = 100.0
@@ -1035,8 +1045,6 @@ class DoomTransformerLoop:
         self._enemy_recent_damage[slot] = 0.0
         self._enemy_last_cmd[slot, :] = 0.0
         self._enemy_memory[slot, :] = 0.0
-        self._enemy_target_lock_index[slot] = 0
-        self._enemy_target_retarget_cooldown_left[slot] = 0
         self._last_enemy_cmds[slot]["speed"] = -1
         self._last_enemy_cmds[slot]["fwd"] = -999
         self._last_enemy_cmds[slot]["side"] = -999
@@ -1046,50 +1054,32 @@ class DoomTransformerLoop:
         self._last_enemy_cmds[slot]["firecd"] = -1
         self._last_enemy_cmds[slot]["healthpct"] = -1
 
-    def _decode_enemy_state_machine(
-        self,
-        slot: int,
-        intent_logits: np.ndarray,
-    ) -> tuple[np.ndarray, int, float, float]:
-        _, timer_norm, intent_probs = self._decode_enemy_intent_state(intent_logits)
-
-        memory_logits = np.zeros(len(self.enemy_intent_names), dtype=np.float32)
-        if 0 <= slot < self.config.enemy_slots and self._enemy_memory.shape[1] >= len(self.enemy_intent_names):
-            memory_logits[:] = self._enemy_memory[slot, : len(self.enemy_intent_names)]
-        memory_scores = memory_logits - float(np.max(memory_logits))
-        memory_probs = np.exp(memory_scores)
-        memory_denom = float(np.sum(memory_probs))
-        if memory_denom > 1e-8:
-            memory_probs /= memory_denom
-        else:
-            memory_probs[:] = 0.0
-            memory_probs[0] = 1.0
-
-        # Transition gate is authored only from Transformer outputs:
-        # intent timer (current transition pressure) + memory confidence (state stickiness).
-        memory_peak = float(np.clip(np.max(memory_probs), 0.0, 1.0))
-        transition_gate = float(np.clip((1.0 - timer_norm) * (1.0 - memory_peak), 0.0, 1.0))
-        state_probs = (1.0 - transition_gate) * memory_probs + transition_gate * intent_probs
-        state_sum = float(np.sum(state_probs))
-        if state_sum > 1e-8:
-            state_probs /= state_sum
-        else:
-            state_probs[:] = 0.0
-            state_probs[0] = 1.0
-        state_id = int(np.argmax(state_probs))
-        return state_probs.astype(np.float32), state_id, timer_norm, transition_gate
-
-    def _decode_enemy_target_memory_state(self, slot: int) -> tuple[float, int, float, float]:
+    def _decode_enemy_target_memory_state(self, slot: int) -> tuple[int, float, float, float, float]:
         if slot < 0 or slot >= self.config.enemy_slots:
-            return 0.0, 1, 0.0, 0.0
+            return 0, 0.0, 0.0, 0.0, 0.0
         memory = self._enemy_memory[slot]
-        if memory.shape[0] < 8:
-            return 0.0, 1, 0.0, 0.0
+        if memory.shape[0] < 9:
+            return 0, 0.0, 0.0, 0.0, 0.0
+        # Memory[8] is explicit target identity channel in [0, 1].
+        lock_index_norm = float(np.clip(0.5 + 0.5 * float(memory[8]), 0.0, 1.0))
+        lock_index = int(
+            np.clip(round(lock_index_norm * float(max(1, self.enemy_target_dim - 1))), 0, self.enemy_target_dim - 1)
+        )
         lock_strength = float(np.clip(0.5 + 0.5 * float(memory[4]), 0.0, 1.0))
-        retarget_cooldown = int(np.clip(round(1.0 + 48.0 * (0.5 + 0.5 * float(memory[5]))), 1, 49))
+        # Memory[5] is interpreted as retarget-readiness phase (timing state authored by Transformer memory).
+        retarget_ready = float(np.clip(0.5 + 0.5 * float(memory[5]), 0.0, 1.0))
         switch_bias = float(np.clip(float(memory[6]), -1.0, 1.0))
         retarget_gate = float(np.clip(0.5 + 0.5 * float(memory[7]), 0.0, 1.0))
-        return lock_strength, retarget_cooldown, switch_bias, retarget_gate
+        return lock_index, lock_strength, retarget_ready, switch_bias, retarget_gate
+
+    def _decode_enemy_engagement_phase(self, slot: int) -> float:
+        if slot < 0 or slot >= self.config.enemy_slots:
+            return 0.5
+        memory = self._enemy_memory[slot]
+        if memory.shape[0] < 10:
+            return 0.5
+        # Explicit engagement phase channel in [0, 1].
+        return float(np.clip(0.5 + 0.5 * float(memory[9]), 0.0, 1.0))
 
     def _decode_enemy_fire_memory_state(self, slot: int) -> tuple[float, float, float, float]:
         if slot < 0 or slot >= self.config.enemy_slots:
@@ -1625,34 +1615,29 @@ class DoomTransformerLoop:
                 if masked_target_scores[proposal_index] <= -1e8:
                     proposal_index = 0
 
-                # Target selection authority: Transformer target logits + memory[4:8].
+                # Target selection authority: Transformer target logits + memory[4:9].
                 # Python keeps only hard validity masking and numeric clipping.
                 (
+                    memory_lock_index,
                     lock_strength,
-                    retarget_cooldown_tics,
+                    retarget_ready,
                     switch_bias,
                     retarget_gate,
                 ) = self._decode_enemy_target_memory_state(slot)
-                if self._enemy_target_retarget_cooldown_left[slot] > 0:
-                    self._enemy_target_retarget_cooldown_left[slot] -= 1
 
-                current_lock = int(np.clip(self._enemy_target_lock_index[slot], 0, self.enemy_target_dim - 1))
-                if not bool(valid_targets[current_lock]):
-                    current_lock = proposal_index
-                if not bool(valid_targets[current_lock]):
-                    current_lock = 0
+                if not bool(valid_targets[memory_lock_index]):
+                    memory_lock_index = proposal_index
+                if not bool(valid_targets[memory_lock_index]):
+                    memory_lock_index = 0
 
                 proposal_score = float(masked_target_scores[proposal_index]) if bool(valid_targets[proposal_index]) else -1e9
-                current_score = float(masked_target_scores[current_lock]) if bool(valid_targets[current_lock]) else -1e9
-                score_margin = float(np.tanh(0.25 * (proposal_score - current_score)))
-                switch_score = score_margin + switch_bias + retarget_gate - lock_strength
-                can_switch = self._enemy_target_retarget_cooldown_left[slot] <= 0
-                if can_switch and bool(valid_targets[proposal_index]) and proposal_index != current_lock and switch_score > 0.0:
-                    current_lock = proposal_index
-                    self._enemy_target_retarget_cooldown_left[slot] = retarget_cooldown_tics
-
-                selected_index = current_lock
-                self._enemy_target_lock_index[slot] = int(selected_index)
+                lock_score = float(masked_target_scores[memory_lock_index]) if bool(valid_targets[memory_lock_index]) else -1e9
+                score_margin = float(np.tanh(0.25 * (proposal_score - lock_score)))
+                hold_strength = float(np.clip(lock_strength * (1.0 - retarget_ready), 0.0, 1.0))
+                switch_score = score_margin + switch_bias + retarget_gate - hold_strength
+                selected_index = memory_lock_index
+                if bool(valid_targets[proposal_index]) and proposal_index != memory_lock_index and switch_score > 0.0:
+                    selected_index = proposal_index
 
                 # Helper is strict index->coordinate mapping + invalid-index clamp.
                 _target_x, _target_y, _target_index = self._select_enemy_target_point(
@@ -1662,13 +1647,9 @@ class DoomTransformerLoop:
                     selected_index,
                 )
 
-                # Enemy state-machine transitions are Transformer-authored from
-                # intent head outputs + persistent memory channels.
-                state_probs, _, state_timer_norm, transition_gate = self._decode_enemy_state_machine(
-                    slot,
-                    enemy_intents[slot],
-                )
-                chase_p, flank_p, retreat_p, hold_p = [float(v) for v in state_probs]
+                intent_id, intent_timer_norm, intent_probs = self._decode_enemy_intent_state(enemy_intents[slot])
+                intent_conf = float(np.clip(np.max(intent_probs), 0.0, 1.0))
+                engagement_phase = self._decode_enemy_engagement_phase(slot)
 
                 # Steering/pathing decode is now direct from Transformer channels.
                 nav_speed_cmd = float(np.clip(2.0 * nav_desired_speed_norm - 1.0, -1.0, 1.0))
@@ -1689,13 +1670,25 @@ class DoomTransformerLoop:
                         1.0,
                     )
                 )
+                side_base_cmd = float(
+                    np.clip(
+                        (1.0 - strafe_mix_cmd) * strafe_cmd + strafe_mix_cmd * side_final_cmd,
+                        -1.0,
+                        1.0,
+                    )
+                )
+                side_nav_cmd = float(np.clip(nav_cover_seek_cmd, -1.0, 1.0))
+                side_coord_cmd = float(np.clip(0.5 * coord_spacing_cmd + 0.5 * coord_avoidance_cmd, -1.0, 1.0))
+                side_nav_blend = float(
+                    np.clip(
+                        (1.0 - move_mix_cmd) * side_base_cmd + move_mix_cmd * side_nav_cmd,
+                        -1.0,
+                        1.0,
+                    )
+                )
                 side_drive = float(
                     np.clip(
-                        (1.0 - strafe_mix_cmd) * strafe_cmd
-                        + strafe_mix_cmd * side_final_cmd
-                        + 0.25 * nav_cover_seek_cmd
-                        + 0.20 * coord_spacing_cmd
-                        + 0.20 * coord_avoidance_cmd,
+                        (1.0 - coord_assist_gate) * side_nav_blend + coord_assist_gate * side_coord_cmd,
                         -1.0,
                         1.0,
                     )
@@ -1709,12 +1702,12 @@ class DoomTransformerLoop:
                         1.0,
                     )
                 )
-                aim_strength = float(
+                aim_policy_score = float(
                     np.clip(
                         ((1.0 - aim_mix_cmd) * aim_cmd_logit + aim_mix_cmd * aim_final_logit)
-                        * (0.35 + 0.65 * aim_conf),
-                        -1.5,
-                        1.5,
+                        + (aim_conf - 0.5),
+                        -2.0,
+                        2.0,
                     )
                 )
                 fire_intent_strength = float(
@@ -1732,64 +1725,44 @@ class DoomTransformerLoop:
                 turn_drive *= float(0.30 + 0.70 * turn_conf)
                 speed_drive *= float(0.35 + 0.65 * (0.5 * advance_conf + 0.5 * strafe_conf))
 
-                # State modulation remains NN-authored (intent+memory), shaping decoded channels.
-                speed_drive = float(
-                    np.clip(
-                        speed_drive * (1.0 + 0.20 * chase_p + 0.06 * flank_p - 0.22 * retreat_p - 0.14 * hold_p),
-                        -1.0,
-                        1.0,
+                # Intent head is authoritative for tactical mode via direct mode-select decode.
+                intent_gate = float(np.clip(0.35 + 0.65 * intent_conf, 0.35, 1.0))
+                if intent_id == 0:  # chase
+                    speed_drive = float(
+                        np.clip((1.0 - intent_gate) * speed_drive + intent_gate * max(speed_drive, nav_speed_cmd, 0.30), -1.0, 1.0)
                     )
-                )
-                fwd_drive = float(
-                    np.clip(
-                        fwd_drive * (1.0 + 0.18 * chase_p - 0.24 * retreat_p - 0.14 * hold_p)
-                        + 0.08 * chase_p
-                        - 0.14 * retreat_p,
-                        -1.0,
-                        1.0,
+                    fwd_drive = float(
+                        np.clip((1.0 - intent_gate) * fwd_drive + intent_gate * max(fwd_drive, fwd_final_cmd, 0.35), -1.0, 1.0)
                     )
-                )
-                side_drive = float(
-                    np.clip(
-                        side_drive * (1.0 + 0.24 * flank_p - 0.10 * retreat_p - 0.06 * hold_p)
-                        + 0.06 * flank_p,
-                        -1.0,
-                        1.0,
+                elif intent_id == 1:  # flank
+                    flank_side = float(side_coord_cmd if abs(side_coord_cmd) > 0.05 else side_nav_blend)
+                    flank_turn = float(
+                        np.clip(turn_final_cmd + 0.30 * np.sign(flank_side if abs(flank_side) > 0.05 else side_drive), -1.0, 1.0)
                     )
-                )
-                turn_drive = float(
-                    np.clip(
-                        turn_drive * (1.0 + 0.20 * flank_p - 0.08 * hold_p),
-                        -1.0,
-                        1.0,
-                    )
-                )
-                aim_strength = float(
-                    np.clip(
-                        aim_strength * (1.0 + 0.16 * chase_p - 0.14 * retreat_p - 0.22 * hold_p)
-                        + 0.10 * state_timer_norm
-                        - 0.05 * transition_gate,
-                        -1.5,
-                        1.5,
-                    )
-                )
-                fire_intent_strength = float(
-                    np.clip(
-                        fire_intent_strength
-                        * (1.0 + 0.20 * chase_p + 0.06 * flank_p - 0.26 * retreat_p - 0.30 * hold_p)
-                        + 0.08 * state_timer_norm
-                        - 0.07 * transition_gate,
-                        -1.5,
-                        1.5,
-                    )
-                )
-                aim_strength *= float(1.0 + 0.15 * coord_assist_gate)
-                fire_intent_strength *= float(1.0 + 0.20 * coord_assist_gate)
+                    side_drive = float(np.clip((1.0 - intent_gate) * side_drive + intent_gate * flank_side, -1.0, 1.0))
+                    turn_drive = float(np.clip((1.0 - intent_gate) * turn_drive + intent_gate * flank_turn, -1.0, 1.0))
+                    speed_drive = float(np.clip(max(speed_drive, 0.20 + 0.40 * intent_timer_norm), -1.0, 1.0))
+                elif intent_id == 2:  # retreat
+                    retreat_push = float(np.clip(max(0.25, nav_retreat_seek_cmd, retreat_mix_cmd), 0.0, 1.0))
+                    speed_drive = float(np.clip(max(speed_drive, 0.15 + 0.45 * retreat_push), -1.0, 1.0))
+                    fwd_drive = float(np.clip(-(max(abs(fwd_drive), retreat_push, 0.35)), -1.0, 1.0))
+                    side_drive = float(np.clip(0.55 * side_coord_cmd, -1.0, 1.0))
+                    fire_intent_strength = float(np.clip(min(fire_intent_strength, 0.1), -1.5, 1.5))
+                else:  # hold
+                    speed_drive = float(np.clip(min(speed_drive, 0.12), -1.0, 1.0))
+                    fwd_drive = 0.0
+                    side_drive = float(np.clip(0.35 * side_coord_cmd, -1.0, 1.0))
+                    turn_drive = float(np.clip(0.60 * turn_drive, -1.0, 1.0))
+                    fire_intent_strength = float(np.clip(min(fire_intent_strength, 0.35), -1.5, 1.5))
+
+                # Explicit engagement-phase channel influences aim/fire readiness.
+                aim_policy_score = float(np.clip(aim_policy_score + 0.45 * (engagement_phase - 0.5), -2.0, 2.0))
+                fire_intent_strength = float(np.clip(fire_intent_strength + 0.40 * (engagement_phase - 0.5), -1.5, 1.5))
 
                 fwd_drive = float(np.clip(fwd_drive, -1.0, 1.0))
                 side_drive = float(np.clip(side_drive, -1.0, 1.0))
                 turn_drive = float(np.clip(turn_drive, -1.0, 1.0))
-                aim_strength = float(np.clip(aim_strength, -1.5, 1.5))
+                aim_policy_score = float(np.clip(aim_policy_score, -2.0, 2.0))
                 fire_intent_strength = float(np.clip(fire_intent_strength, -1.5, 1.5))
 
                 speed_norm = float(np.clip(0.5 + 0.5 * speed_drive, 0.0, 1.0))
@@ -1797,7 +1770,9 @@ class DoomTransformerLoop:
                 fwd = int(np.clip(round(100.0 * fwd_drive), -100, 100))
                 side = int(np.clip(round(100.0 * side_drive), -100, 100))
                 turn = int(np.clip(round(120.0 * turn_drive), -120, 120))
-                aim = 1 if aim_strength > 0.05 else 0
+                # Aim gating is directly NN-authored from aim policy channels.
+                aim_threshold = float(np.clip(0.20 - 0.40 * engagement_phase, -0.20, 0.30))
+                aim = 1 if aim_policy_score > aim_threshold else 0
                 fire_enable = fire_enable_logit > 0.0
                 (
                     fire_ready_phase,
@@ -1862,8 +1837,6 @@ class DoomTransformerLoop:
                 aim = 0
                 fire = 0
                 self._enemy_memory[slot, :] = 0.0
-                self._enemy_target_lock_index[slot] = 0
-                self._enemy_target_retarget_cooldown_left[slot] = 0
                 healthpct = 100
             commands.append((speed, fwd, side, turn, aim, fire))
             self._enemy_last_cmd[slot, 0] = float(speed)
@@ -2244,23 +2217,30 @@ class DoomTransformerLoop:
         )
         print(
             f"Enemy memory-update head: channels={self.enemy_memory_update_dim} "
-            "(gate + 8-dim delta per slot)"
+            f"(gate + {self.enemy_memory_feature_dim}-dim delta per slot)"
         )
         print(
-            "Enemy state-machine source: intent head + memory[0:4] persistence => "
-            f"{'/'.join(self.enemy_intent_names)}"
+            "Enemy intent head source: direct mode-select authority => "
+            f"{'/'.join(self.enemy_intent_names)} + intent_timer_norm"
         )
         print(
-            "Enemy target persistence source: memory[4:8] => "
-            "lock_strength/retarget_cooldown/switch_bias/retarget_gate"
+            "Enemy target persistence source: memory[4:9] => "
+            "memory_lock_index/lock_strength/retarget_ready/switch_bias/retarget_gate"
         )
         print(
             "Enemy fire temporal source: memory[4:8] => "
             "ready/burst/cadence/reaction phases (counter-free)"
         )
         print(
+            "Enemy engagement phase source: memory[9] => engagement_phase_norm"
+        )
+        print(
             "Enemy fire arbitration source: direct NN policy logits + memory phases; "
             "no local startup/threshold heuristics"
+        )
+        print(
+            "Enemy aim source: direct NN aim-policy decode (cmd/final/conf/mix); "
+            "no backend aim-threshold shaping"
         )
         print(
             "Enemy nav-intent channels active: "
@@ -2270,6 +2250,10 @@ class DoomTransformerLoop:
             "Enemy steering source: direct NN channels "
             "(speed/advance/strafe/turn + final/nav + conf/mix); "
             "Python applies clip/collision safety only"
+        )
+        print(
+            "Enemy coordination source: direct NN assist/spacing/avoidance blend; "
+            "no additive coord offsets in backend decode"
         )
         print(f"State dim: {self.state_dim} | Transformer context: {self.config.context}")
 
