@@ -69,15 +69,15 @@ python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-
   - Transformer behavior channels are decoded into backend actuation:
     - behavior channels: 37 core channels (`speed_cmd`, `advance_cmd`, `strafe_cmd`, `turn_cmd`, `aim_cmd_logit`, `fire_cmd_logit`, `advance_conf`, `strafe_conf`, `turn_conf`, `aim_conf`, `fire_conf`, `move_mix_cmd`, `strafe_mix_cmd`, `turn_mix_cmd`, `aim_mix_cmd`, `fire_mix_cmd`, `retreat_mix_cmd`, `health_cmd_norm`, `target_index_cmd_norm`, `fwd_final_cmd`, `side_final_cmd`, `turn_final_cmd`, `aim_final_logit`, `fire_final_logit`, `target_blend_logit`, `fire_enable_logit`, `burst_len_norm`, `inter_shot_delay_norm`, `reaction_delay_norm`, `coord_focus_target_index_norm`, `coord_assist_gate_logit`, `coord_spacing_cmd`, `coord_avoidance_cmd`, `nav_desired_heading_cmd`, `nav_desired_speed_norm`, `nav_cover_seek_cmd`, `nav_retreat_seek_cmd`) plus target-selection logits (`target_player_logit`, `target_slot_00_logit` ... `target_slot_15_logit`)
     - per-slot target decode is model-side (`target_index_cmd_norm` + target logits + focus/assist channels), with persistence/state transitions authored by memory channels (`lock_strength`, `retarget_cooldown`, `threat_age_decay`, `retarget_gate` from memory[4:8]); Python only applies validity clamps
-    - final movement/pathing/aim are decoded from explicit NN navigation intent channels (`nav_desired_heading_cmd`, `nav_desired_speed_norm`, `nav_cover_seek_cmd`, `nav_retreat_seek_cmd`) plus memory tactical modulation
+    - final movement/pathing/aim are decoded directly from NN steering channels (`speed_cmd`, `advance_cmd`, `strafe_cmd`, `turn_cmd`, `fwd/side/turn_final`, `nav_*`, confidence + mix gates) plus NN state-machine modulation
     - actuation channels sent to Doom/mod: `speed`, `fwd`, `side`, `turn`, `aim`, `fire`
   - aiming/firing are driven by final actuator + explicit fire-policy logits:
     - `aim_final_logit` -> backend `aim`
     - `fire_final_logit` + `fire_enable_logit` + (`burst_len_norm`, `inter_shot_delay_norm`, `reaction_delay_norm`) -> backend `fire` timing
     - `inter_shot_delay_norm` -> backend `nn_enemy_cmd_*_firecd`
-    - no rule-based action-state cadence shaping is applied
+    - temporal fire-phase gating is memory-authored (memory[4:8]); no local burst/reaction counters are used
   - enemy health (`nn_enemy_cmd_*_healthpct`) is now driven from `health_cmd_norm`
-  - separate enemy intent head (`chase/flank/retreat/hold` + timer) is currently exposed for diagnostics/compatibility, while tactical state authority is carried by memory channels
+  - enemy intent head (`chase/flank/retreat/hold` + timer) is now part of backend authority: state transitions blend intent logits with memory[0:4] persistence channels (no hand-authored transition rules)
   - low-level channels keep a firecd proxy for diagnostics only
 - Per-enemy memory state is maintained in-loop as a persistent latent (`8` values/slot), updated each tick only by Transformer memory-update outputs (gate + delta), and fed back into `state_in`.
 - Doom remains authoritative for rendering and core simulation (physics, collisions, damage, doors/triggers, pickups, map logic).
@@ -103,12 +103,12 @@ python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-
 ### 3. Number of parameters
 
 - Default runtime (`1024x768`, `frame_pool=16`):
-  - `state_dim = 3871`.
-  - Total parameters: `4,380,793`.
+  - `state_dim = 3919`.
+  - Total parameters: `4,405,417`.
   - Trainable parameters: `0`.
 - At `1280x960` with `frame_pool=16`:
-  - `state_dim = 5599`.
-  - Total parameters: `5,267,257`.
+  - `state_dim = 5647`.
+  - Total parameters: `5,291,881`.
 
 ### 4. Input features
 
@@ -120,8 +120,8 @@ Per tick, one `state_in` vector is built and then stacked over time (`context=32
   - For `1280x960` with `frame_pool=16`: `4800` values (`80 x 60`).
 - Keyboard features: `10` values:
   - forward, backward, strafe-left, strafe-right, turn-left, turn-right, look-up, look-down, attack, use.
-- Enemy slot features: `enemy_slots * 40` values (default `16 * 40 = 640`), with stable ID->slot tracking:
-  - Base features (`21`/slot): alive flag, relative x/y, velocity x/y, facing angle, observed health proxy, distance to player, bearing to player, line-of-sight flag, cooldown proxy, 4 wall-ray probes (forward/left/right/back), incoming-threat direction/intensity, recent-damage proxy, nearest-cover lateral/retreat hints.
+- Enemy slot features: `enemy_slots * 43` values (default `16 * 43 = 688`), with stable ID->slot tracking:
+  - Base features (`24`/slot): alive flag, relative x/y, velocity x/y, facing angle, observed health proxy, distance to player, bearing to player, line-of-sight flag, cooldown proxy, 4 wall-ray probes (forward/left/right/back), incoming-threat direction/intensity, recent-damage proxy, nearest-cover lateral/retreat hints, ally velocity flow, line-of-fire conflict, assist pressure.
   - Feedback features (`11`/slot): last command (`speed/fwd/side/turn/aim/fire`) and observed response (`moved_dist`, `turn_delta`, `LOS_changed`, `blocked`, `shot_fired`).
 - Memory features (`8`/slot): persistent NN-updated latent channels (no fixed hand-authored semantics), carried across ticks and fed back into `state_in`.
 - Target-valid mask features: `1 + enemy_slots` values (default `17`) for model-facing target validity (`player + slot occupancy`).
@@ -172,5 +172,5 @@ Per tick, one `state_in` vector is built and then stacked over time (`context=32
 - Experimental enemy-backend mode:
   - Build mod with `python3 build_enemy_nn_mod.py`.
   - Enable with `--enemy-backend-transformer --enemy-backend-mod enemy_nn_backend_mod.pk3`.
-  - Current implementation applies per-slot monster movement/pathing/aiming/firing control commands from Transformer outputs, with direct NN target decode + memory-authored target persistence (lock/cooldown/threat-age), explicit NN fire-policy decode, memory-authoritative tactical state (`aggressive/suppressed/recovering/flanking`), explicit NN coordination decode (`focus-target`, `assist gate`, `spacing`, `avoidance`), and explicit NN navigation-intent decode (`desired heading/speed`, `cover seek`, `retreat seek`) in the backend loop.
+  - Current implementation applies per-slot monster movement/pathing/aiming/firing control commands from Transformer outputs, with direct NN target decode + memory-authored target persistence (lock/cooldown/threat-age), direct NN steering decode (`speed/advance/strafe/turn`, `fwd/side/turn_final`, `nav_*`, confidence + mix gates) with only clip/collision safety outside, explicit NN fire-policy decode + memory-authored fire temporal state (no local counters), NN state-machine transitions (`chase/flank/retreat/hold`) from intent logits + memory[0:4] persistence, and explicit NN coordination decode (`focus-target`, `assist gate`, `spacing`, `avoidance`) in the backend loop.
   - Target mapping helper is strict index->coordinate lookup with invalid-index clamp only (no confidence shaping).
