@@ -48,6 +48,9 @@ python3 e1m1_transformer_backend.py --nn-weight-scale 0.55 --nn-control-gain 1.0
 # Slow enemies/world pace
 python3 e1m1_transformer_backend.py --doom-ticrate 16 --doom-skill 1
 
+# Deterministic world RNG
+python3 e1m1_transformer_backend.py --doom-seed 1
+
 # Build and enable experimental Transformer enemy-backend override
 python3 build_enemy_nn_mod.py
 python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-mod enemy_nn_backend_mod.pk3 --enemy-slots 16
@@ -56,7 +59,10 @@ python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-
 python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-mod enemy_nn_backend_mod.pk3 --nn-world-sim --nn-world-damage-scale 1.0
 
 # Headless regression runner (parses and checks enemy metrics)
-python3 run_enemy_regression.py --wad DOOM.WAD --enemy-backend-mod enemy_nn_backend_mod.pk3 --max-ticks 256
+python3 run_enemy_regression.py --wad DOOM.WAD --enemy-backend-mod enemy_nn_backend_mod.pk3 --max-ticks 5000
+
+# Long-run multi-map/multi-seed gate (5k ticks each)
+python3 run_enemy_regression.py --wad DOOM.WAD --enemy-backend-mod enemy_nn_backend_mod.pk3 --maps E1M1,E1M2 --seeds 1,2,3 --max-ticks 5000
 ```
 
 ## Transformer Backend Details
@@ -75,7 +81,7 @@ python3 run_enemy_regression.py --wad DOOM.WAD --enemy-backend-mod enemy_nn_back
 - In `--enemy-backend-transformer` mode, the loop also sends per-slot enemy commands to a custom mod (`enemy_nn_backend_mod.pk3`) each tick:
   - Transformer behavior channels are decoded into backend actuation:
     - behavior channels: 38 core channels (`speed_cmd`, `advance_cmd`, `strafe_cmd`, `turn_cmd`, `aim_cmd_logit`, `fire_cmd_logit`, `advance_conf`, `strafe_conf`, `turn_conf`, `aim_conf`, `fire_conf`, `move_mix_cmd`, `strafe_mix_cmd`, `turn_mix_cmd`, `aim_mix_cmd`, `fire_mix_cmd`, `retreat_mix_cmd`, `health_cmd_norm`, `target_index_cmd_norm`, `fwd_final_cmd`, `side_final_cmd`, `turn_final_cmd`, `aim_final_logit`, `fire_final_logit`, `target_blend_logit`, `fire_enable_logit`, `burst_len_norm`, `inter_shot_delay_norm`, `reaction_delay_norm`, `coord_focus_target_index_norm`, `coord_assist_gate_logit`, `coord_spacing_cmd`, `coord_avoidance_cmd`, `nav_desired_heading_cmd`, `nav_desired_speed_norm`, `nav_cover_seek_cmd`, `nav_retreat_seek_cmd`, `firecd_cmd_norm`) plus target-selection logits (`target_player_logit`, `target_slot_00_logit` ... `target_slot_15_logit`)
-    - per-slot target selection is model-memory-driven from `target_identity_norm`; Python only applies hard validity clamps
+    - per-slot target selection is model-memory-driven from `target_identity_norm`; Python only applies index-range safety clamp
     - final backend actuation is fully direct from final actuator channels (`speed/fwd/side/turn/aim/fire/firecd/health`); Python only applies hard command clamps
     - actuation channels sent to Doom/mod: `speed`, `fwd`, `side`, `turn`, `aim`, `fire`
   - aiming/firing and timing are driven by actuator channels with model-memory phase state:
@@ -128,8 +134,8 @@ Per tick, one `state_in` vector is built and then stacked over time (`context=32
   - For `1280x960` with `frame_pool=16`: `4800` values (`80 x 60`).
 - Keyboard features: `10` values:
   - forward, backward, strafe-left, strafe-right, turn-left, turn-right, look-up, look-down, attack, use.
-- Enemy slot features: `enemy_slots * 45` values (default `16 * 45 = 720`), with stable ID->slot tracking:
-  - Base features (`24`/slot): alive flag, relative x/y, velocity x/y, facing angle, observed health proxy, distance to player, bearing to player, line-of-sight flag, cooldown proxy, 4 wall-ray probes (forward/left/right/back), incoming-threat direction/intensity, recent-damage proxy, nearest-cover lateral/retreat hints, ally velocity flow, line-of-fire conflict, assist pressure.
+- Enemy slot features: `enemy_slots * 45` values (default `16 * 45 = 720`), with direct per-frame slot mapping:
+  - Base features (`24`/slot): alive flag, relative x/y, velocity x/y, facing angle, observed health proxy, distance to player, bearing to player, coarse LOS proxy, cooldown proxy, recent-damage proxy, and reserved placeholders for model-owned latent perception.
   - Feedback features (`11`/slot): last command (`speed/fwd/side/turn/aim/fire`) and observed response (`moved_dist`, `turn_delta`, `LOS_changed`, `blocked`, `shot_fired`).
 - Memory features (`10`/slot): persistent NN-updated latent channels, carried across ticks and fed back into `state_in`.
   - includes explicit `target_identity_norm` and `engagement_phase_norm` channels.
@@ -181,6 +187,6 @@ Per tick, one `state_in` vector is built and then stacked over time (`context=32
 - Experimental enemy-backend mode:
   - Build mod with `python3 build_enemy_nn_mod.py`.
   - Enable with `--enemy-backend-transformer --enemy-backend-mod enemy_nn_backend_mod.pk3`.
-  - Current implementation applies per-slot monster movement/pathing/aiming/firing commands from Transformer outputs, with model-memory target identity (`target_identity_norm`), direct actuator command decode (`speed/fwd/side/turn/aim/fire/firecd/health`), and only hard command/validity clamps outside.
+  - Current implementation applies per-slot monster movement/pathing/aiming/firing commands from Transformer outputs, with model-memory target identity (`target_identity_norm`), direct actuator command decode (`speed/fwd/side/turn/aim/fire/firecd/health`), and only crash-safe command/index clamps outside.
   - Fire gating/timing is model-driven (actuator logits + memory-phase channels), without Python fire counters/rule thresholds.
-  - Headless runs print regression metrics summary (`shots_per_tick`, `target_switches`, `close_pairs_per_tick`, `player_max_stuck_ticks`) at session end.
+  - Headless runs print regression metrics summary (`shots_per_tick`, `target_switches`, `close_pairs_per_tick`, `player_max_stuck_ticks`, `mse_mean`, `mse_drift`) at session end.

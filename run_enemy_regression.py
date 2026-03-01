@@ -17,7 +17,9 @@ METRIC_RE = re.compile(
     r"target_switches_per_tick=(?P<switch_tick>[0-9.]+)\s+"
     r"target_switches_per_enemy_tick=(?P<switch_enemy>[0-9.]+)\s+"
     r"close_pairs_per_tick=(?P<close_pairs>[0-9.]+)\s+"
-    r"player_max_stuck_ticks=(?P<stuck>\d+)"
+    r"player_max_stuck_ticks=(?P<stuck>\d+)\s+"
+    r"mse_mean=(?P<mse_mean>[0-9.]+)\s+"
+    r"mse_drift=(?P<mse_drift>-?[0-9.]+)"
 )
 
 
@@ -26,22 +28,46 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--python", default=sys.executable, help="Python executable")
     p.add_argument("--backend", default="e1m1_transformer_backend.py", help="Backend script path")
     p.add_argument("--wad", default="DOOM.WAD", help="Path to DOOM.WAD")
-    p.add_argument("--map", default="E1M1", help="Map name")
+    p.add_argument("--map", default="E1M1", help="Single map name (legacy shortcut)")
+    p.add_argument("--maps", default="", help="Comma-separated map list (e.g. E1M1,E1M2)")
+    p.add_argument("--seeds", default="1,2,3", help="Comma-separated seed list")
     p.add_argument("--enemy-backend-mod", default="enemy_nn_backend_mod.pk3", help="Enemy backend mod path")
     p.add_argument("--enemy-slots", type=int, default=16, help="Enemy slots")
-    p.add_argument("--max-ticks", type=int, default=256, help="Headless ticks")
-    p.add_argument("--log-interval", type=int, default=32, help="Tick log interval")
+    p.add_argument("--max-ticks", type=int, default=5000, help="Headless ticks (use 5000-20000 for long-run gates)")
+    p.add_argument("--log-interval", type=int, default=256, help="Tick log interval")
     p.add_argument("--max-close-pairs-per-tick", type=float, default=4.0)
     p.add_argument("--max-target-switches-per-enemy-tick", type=float, default=0.20)
-    p.add_argument("--min-shots-per-tick", type=float, default=0.0)
+    p.add_argument("--min-shots-per-tick", type=float, default=0.02)
     p.add_argument("--max-shots-per-tick", type=float, default=1.25)
     p.add_argument("--max-player-stuck-ticks", type=int, default=96)
+    p.add_argument("--max-mse-mean", type=float, default=0.20)
+    p.add_argument("--max-mse-drift", type=float, default=0.03)
+    p.add_argument("--fail-fast", action="store_true", help="Stop on first failing map/seed case")
     return p.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
+def _parse_maps(args: argparse.Namespace) -> list[str]:
+    raw = args.maps.strip()
+    if raw:
+        maps = [m.strip() for m in raw.split(",") if m.strip()]
+        if maps:
+            return maps
+    return [args.map]
 
+
+def _parse_seeds(seed_text: str) -> list[int]:
+    seeds: list[int] = []
+    for token in seed_text.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        seeds.append(int(token))
+    if not seeds:
+        seeds = [1]
+    return seeds
+
+
+def _evaluate_case(args: argparse.Namespace, map_name: str, seed: int) -> tuple[list[str], int]:
     backend = Path(args.backend)
     wad = Path(args.wad)
     mod = Path(args.enemy_backend_mod)
@@ -52,7 +78,7 @@ def main() -> int:
         "--wad",
         str(wad),
         "--map",
-        args.map,
+        map_name,
         "--headless",
         "--max-ticks",
         str(args.max_ticks),
@@ -63,23 +89,32 @@ def main() -> int:
         str(mod),
         "--enemy-slots",
         str(args.enemy_slots),
+        "--doom-seed",
+        str(seed),
     ]
 
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    print(f"=== map={map_name} seed={seed} ===")
     print(proc.stdout)
+
+    failures: list[str] = []
+    if proc.returncode != 0:
+        failures.append(f"backend exit status {proc.returncode}")
+        return failures, proc.returncode
 
     match = METRIC_RE.search(proc.stdout)
     if match is None:
-        print("FAIL: Could not find 'Enemy regression metrics' line in output.", file=sys.stderr)
-        return 2
+        failures.append("missing 'Enemy regression metrics' line")
+        return failures, 2
 
     ticks = int(match.group("ticks"))
     shots_per_tick = float(match.group("shots"))
     switches_per_enemy_tick = float(match.group("switch_enemy"))
     close_pairs_per_tick = float(match.group("close_pairs"))
     player_max_stuck_ticks = int(match.group("stuck"))
+    mse_mean = float(match.group("mse_mean"))
+    mse_drift = float(match.group("mse_drift"))
 
-    failures: list[str] = []
     if shots_per_tick < args.min_shots_per_tick:
         failures.append(
             f"shots_per_tick {shots_per_tick:.3f} < min_shots_per_tick {args.min_shots_per_tick:.3f}"
@@ -102,24 +137,50 @@ def main() -> int:
         failures.append(
             f"player_max_stuck_ticks {player_max_stuck_ticks} > max_player_stuck_ticks {args.max_player_stuck_ticks}"
         )
+    if mse_mean > args.max_mse_mean:
+        failures.append(
+            f"mse_mean {mse_mean:.6f} > max_mse_mean {args.max_mse_mean:.6f}"
+        )
+    if abs(mse_drift) > args.max_mse_drift:
+        failures.append(
+            f"|mse_drift| {abs(mse_drift):.6f} > max_mse_drift {args.max_mse_drift:.6f}"
+        )
 
     print(
         "Parsed metrics: "
         f"ticks={ticks} shots_per_tick={shots_per_tick:.3f} "
         f"target_switches_per_enemy_tick={switches_per_enemy_tick:.4f} "
         f"close_pairs_per_tick={close_pairs_per_tick:.3f} "
-        f"player_max_stuck_ticks={player_max_stuck_ticks}"
+        f"player_max_stuck_ticks={player_max_stuck_ticks} "
+        f"mse_mean={mse_mean:.6f} mse_drift={mse_drift:.6f}"
     )
+    return failures, 0
 
-    if failures:
+
+def main() -> int:
+    args = parse_args()
+    maps = _parse_maps(args)
+    seeds = _parse_seeds(args.seeds)
+
+    all_failures: list[str] = []
+    for map_name in maps:
+        for seed in seeds:
+            failures, status = _evaluate_case(args, map_name, seed)
+            if failures:
+                for failure in failures:
+                    all_failures.append(f"[map={map_name} seed={seed}] {failure}")
+                if args.fail_fast:
+                    break
+            if status != 0 and args.fail_fast:
+                break
+        if all_failures and args.fail_fast:
+            break
+
+    if all_failures:
         print("FAIL:", file=sys.stderr)
-        for line in failures:
+        for line in all_failures:
             print(f"- {line}", file=sys.stderr)
         return 3
-
-    if proc.returncode != 0:
-        print(f"FAIL: Backend exited with status {proc.returncode}", file=sys.stderr)
-        return proc.returncode
 
     print("PASS")
     return 0
