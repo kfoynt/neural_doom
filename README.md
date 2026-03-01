@@ -51,6 +51,9 @@ python3 e1m1_transformer_backend.py --doom-ticrate 16 --doom-skill 1
 # Build and enable experimental Transformer enemy-backend override
 python3 build_enemy_nn_mod.py
 python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-mod enemy_nn_backend_mod.pk3 --enemy-slots 16
+
+# Headless regression runner (parses and checks enemy metrics)
+python3 run_enemy_regression.py --wad DOOM.WAD --enemy-backend-mod enemy_nn_backend_mod.pk3 --max-ticks 256
 ```
 
 ## Transformer Backend Details
@@ -60,25 +63,25 @@ python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-
 - The Transformer runs every tick on a temporal state window (`context=32`) and outputs:
   - `state_out` (predicted next backend state vector).
   - `control_logits` (decoded into Doom control actions).
-  - `enemy_logits` (per-slot enemy backend command logits when enemy backend mode is enabled).
-  - `enemy_intent_logits` (per-slot intent logits + timer signal for NN-space enemy state machine).
-  - `enemy_actuator_logits` (per-slot final actuator commands: speed/fwd/side/turn/aim/fire/firecd/health).
+  - `enemy_logits` (legacy diagnostic head; not used in final enemy actuation path).
+  - `enemy_intent_logits` (legacy diagnostic head; not used in final enemy actuation path).
+  - `enemy_actuator_logits` (per-slot final actuator commands: movement/turn/aim/fire/firecd/health plus movement-resolution, target-select, and combat-timing channels).
   - `low_level_logits` (non-standard backend knobs for player dynamics).
   - `memory_update_logits` (per-slot memory update channels: gate + delta for persistent enemy latent state).
 - The player action sent to Doom is computed from Transformer logits each tick (keyboard-gated, NN-modulated strength/conflict resolution).
 - In `--enemy-backend-transformer` mode, the loop also sends per-slot enemy commands to a custom mod (`enemy_nn_backend_mod.pk3`) each tick:
   - Transformer behavior channels are decoded into backend actuation:
     - behavior channels: 38 core channels (`speed_cmd`, `advance_cmd`, `strafe_cmd`, `turn_cmd`, `aim_cmd_logit`, `fire_cmd_logit`, `advance_conf`, `strafe_conf`, `turn_conf`, `aim_conf`, `fire_conf`, `move_mix_cmd`, `strafe_mix_cmd`, `turn_mix_cmd`, `aim_mix_cmd`, `fire_mix_cmd`, `retreat_mix_cmd`, `health_cmd_norm`, `target_index_cmd_norm`, `fwd_final_cmd`, `side_final_cmd`, `turn_final_cmd`, `aim_final_logit`, `fire_final_logit`, `target_blend_logit`, `fire_enable_logit`, `burst_len_norm`, `inter_shot_delay_norm`, `reaction_delay_norm`, `coord_focus_target_index_norm`, `coord_assist_gate_logit`, `coord_spacing_cmd`, `coord_avoidance_cmd`, `nav_desired_heading_cmd`, `nav_desired_speed_norm`, `nav_cover_seek_cmd`, `nav_retreat_seek_cmd`, `firecd_cmd_norm`) plus target-selection logits (`target_player_logit`, `target_slot_00_logit` ... `target_slot_15_logit`)
-    - per-slot target decode is model-side from direct selected index (`target_index_cmd_norm`) + target logits + keep/switch gate (`target_blend_logit`); Python only applies hard validity clamps
-    - final movement/pathing are decoded from NN steering/intents, then the final actuator head becomes authoritative for backend actuation
+    - per-slot target decode is fully actuator-side from `act_target_index_norm` + `act_target_keep_gate_logit` + `act_target_switch_gate_logit`; Python only applies hard validity clamps
+    - final backend actuation is fully direct from the final actuator head (movement/turn/aim/fire/firecd/health + movement-resolution channels); Python only applies hard command clamps
     - actuation channels sent to Doom/mod: `speed`, `fwd`, `side`, `turn`, `aim`, `fire`
-  - aiming/firing are driven by final actuator + explicit fire-policy logits:
-    - `aim_cmd_logit` + `aim_final_logit` + (`aim_conf`, `aim_mix_cmd`) -> backend `aim` pulse decision
-    - `fire_final_logit` + `fire_enable_logit` + (`burst_len_norm`, `inter_shot_delay_norm`, `reaction_delay_norm`) + memory fire phases -> backend `fire` pulse decisions
-    - final actuator fire cadence channel (`act_firecd_norm`) -> backend `nn_enemy_cmd_*_firecd` (legacy behavior cadence blended in)
-    - temporal fire-phase gating is memory-authored (memory[4:8]); no local startup/threshold branch logic is used
-  - enemy health (`nn_enemy_cmd_*_healthpct`) is now driven by final actuator health (`act_health_norm`) with a small legacy behavior blend
-  - enemy intent head (`chase/flank/retreat/hold` + timer) is now authoritative via direct soft tactical mode mixing
+  - aiming/firing and timing are driven by explicit actuator channels:
+    - `act_aim_logit` vs `act_aim_gate_logit` -> backend `aim` decision
+    - `act_fire_logit` vs `act_fire_gate_logit` -> backend `fire` decision
+    - `act_fire_enable_logit` + `act_burst_len_norm` + `act_inter_shot_delay_norm` + `act_reaction_delay_norm` -> backend fire-state timing
+    - `act_inter_shot_delay_norm` -> backend `nn_enemy_cmd_*_firecd`
+  - enemy health (`nn_enemy_cmd_*_healthpct`) is driven directly from `act_health_norm`
+  - enemy intent head (`chase/flank/retreat/hold` + timer) is currently emitted as model context/diagnostics (not in final actuator path)
 - Per-enemy memory state is maintained in-loop as a persistent latent (`10` values/slot), updated each tick only by Transformer memory-update outputs (gate + delta), and fed back into `state_in`.
   - explicit memory channels now include `target_identity_norm` and `engagement_phase_norm`.
 - Doom remains authoritative for rendering and core simulation (physics, collisions, damage, doors/triggers, pickups, map logic).
@@ -96,7 +99,7 @@ python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-
   - `control_out_proj`: `Linear(256 -> 6)`.
   - `enemy_out_proj`: `Linear(256 -> enemy_slots * enemy_cmd_dim)` (default `16 * 55`; 38 core channels + 17 target logits per slot).
   - `enemy_intent_out_proj`: `Linear(256 -> enemy_slots * enemy_intent_dim)` (default `16 * 5`; 4 intent logits + 1 timer signal per slot).
-  - `enemy_actuator_out_proj`: `Linear(256 -> enemy_slots * enemy_actuator_dim)` (default `16 * 8` for speed/fwd/side/turn/aim/fire/firecd/health).
+  - `enemy_actuator_out_proj`: `Linear(256 -> enemy_slots * enemy_actuator_dim)` (default `16 * 21` for speed/fwd/side/turn/aim/fire/firecd/health/aim-gate/fire-gate/move-dx/move-dy/slide-bias/separation-gain/target-index/target-keep/target-switch/fire-enable/burst-len/inter-shot-delay/reaction-delay).
   - `low_level_out_proj`: `Linear(256 -> low_level_dim)` where `low_level_dim = 4 + enemy_slots * 1` (default `20`).
   - `memory_out_proj`: `Linear(256 -> enemy_slots * memory_update_dim)` where `memory_update_dim = 1 + memory_dim` (default `11` = gate + 10-delta).
 - Context length: `32`.
@@ -106,11 +109,11 @@ python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-
 
 - Default runtime (`1024x768`, `frame_pool=16`):
   - `state_dim = 3951`.
-  - Total parameters: `4,467,065`.
+  - Total parameters: `4,520,521`.
   - Trainable parameters: `0`.
 - At `1280x960` with `frame_pool=16`:
   - `state_dim = 5679`.
-  - Total parameters: `5,353,529`.
+  - Total parameters: `5,406,985`.
 
 ### 4. Input features
 
@@ -168,13 +171,14 @@ Per tick, one `state_in` vector is built and then stacked over time (`context=32
 - The Transformer predicts both:
   - `state_out` (next state vector)
   - control logits (decoded to Doom buttons)
-  - enemy logits (decoded to per-slot enemy backend movement/aim/fire + cadence commands when enabled)
-  - enemy intent logits (decoded per slot: chase/flank/retreat/hold + timer channels)
-  - enemy actuator logits (decoded per slot: final speed/fwd/side/turn/aim/fire/firecd/health commands)
+  - enemy logits (legacy diagnostics)
+  - enemy intent logits (legacy diagnostics)
+  - enemy actuator logits (decoded per slot: final movement/turn/aim/fire/firecd/health + movement-resolution + target-select + combat-timing channels)
   - low-level logits (decoded to non-standard player dynamics)
 - Player control is keyboard-gated but now NN-modulated each tick: control logits scale movement/turn strength, and still resolve opposing-key conflicts.
 - Experimental enemy-backend mode:
   - Build mod with `python3 build_enemy_nn_mod.py`.
   - Enable with `--enemy-backend-transformer --enemy-backend-mod enemy_nn_backend_mod.pk3`.
-  - Current implementation applies per-slot monster movement/pathing/aiming/firing control commands from Transformer outputs, with direct NN target decode (selected index + target logits + keep/switch gate), direct NN intent-head tactical mode selection (`chase/flank/retreat/hold`), direct NN steering decode (`speed/advance/strafe/turn`, `fwd/side/turn_final`, `nav_*`, confidence + mix gates), and a direct NN final actuator head for backend actuation (`act_speed/fwd/side/turn/aim/fire/firecd/health`) with only clip/collision safety outside.
+  - Current implementation applies per-slot monster movement/pathing/aiming/firing control commands from Transformer outputs, with direct actuator target decode (`act_target_index_norm` + keep/switch gates), direct actuator movement resolution (`act_move_dx_cmd/act_move_dy_cmd/act_slide_bias_norm/act_separation_gain_norm`), and direct actuator combat timing (`act_fire_enable_logit/act_burst_len_norm/act_inter_shot_delay_norm/act_reaction_delay_norm`), with only hard command/validity clamps outside.
   - Target mapping helper is strict index->coordinate lookup with invalid-index clamp only.
+  - Headless runs print regression metrics summary (`shots_per_tick`, `target_switches`, `close_pairs_per_tick`) at session end.
