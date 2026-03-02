@@ -88,6 +88,9 @@ python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-
 # One-command pure launcher (recommended)
 ./run_pure.sh
 
+# Diagnostics-focused run (same launcher, frequent logs)
+./run_pure.sh --log-interval 1
+
 # Headless regression runner (parses and checks enemy metrics)
 python3 run_enemy_regression.py --wad DOOM.WAD --enemy-backend-mod enemy_nn_backend_mod.pk3 --max-ticks 5000
 # quick one-off (no mandatory release-suite expansion)
@@ -258,6 +261,16 @@ Per tick, one `state_in` vector is built and then stacked over time (`context=32
   - `System Settings -> Privacy & Security -> Input Monitoring`
 - In `auto` mode (visible run), the script now prefers `pygame_window` first for strict key-up/key-down behavior and less sticky-input risk.
 - `pygame_window` mode is now a single focused game window (`Transformer Doom (focus this window)`): it renders Doom frames and captures keyboard input in the same window.
+- Diagnostics overlay is available in `pygame_window` mode:
+  - `F1`: toggle diagnostics panel.
+  - `F2`: cycle attention head pages (`+4` heads per press).
+  - `F3`: next Transformer layer.
+  - `F4`: previous Transformer layer.
+  - `F5`: toggle attention display mode (`ABS` vs `DELTA`).
+- Heatmaps/values are updated every tick from current model outputs:
+  - Panel uses live attention tensors from the latest forward pass (no running mean).
+  - `attn_sig` and `attn_d` in the panel are per-tick diagnostics of attention state/change.
+  - If scene/input is static, `ABS` attention can look stable; use `F5` (`DELTA`) to visualize frame-to-frame changes directly.
 - Strict keyboard gating for sampled keys: when no key is sampled, the loop avoids injecting movement/fire/use actions.
 - Control actions are now re-sampled every Doom tic (even when `--action-repeat > 1`) to reduce sticky movement on key release.
 - `--action-repeat` controls movement/turn speed by applying each decoded action for multiple VizDoom ticks (default `5`).
