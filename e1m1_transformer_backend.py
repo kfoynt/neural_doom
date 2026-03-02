@@ -25,8 +25,25 @@ from vizdoom import Button, DoomGame, GameVariable, Mode, ScreenFormat, ScreenRe
 class WADCollisionMap:
     """Minimal Doom map collision extractor (blocking linedefs) + 2D motion resolver."""
 
+    # Doom-format manual door linedef specials (use/switch activated).
+    # Keep this tight to avoid blocking generic trigger lines.
+    DOOR_MANUAL_SPECIALS = {
+        1,    # DR Door Open Wait Close
+        26,   # Blue key door
+        27,   # Yellow key door
+        28,   # Red key door
+        31,   # D1 Door Open Stay
+        32,   # Blue key door (open stay)
+        33,   # Red key door (open stay)
+        34,   # Yellow key door (open stay)
+        63,   # SR Door Open Stay
+        103,  # S1 Door Open Stay
+        117,  # Blazing door variants
+        118,
+    }
+
     def __init__(self, wad_path: Path, map_name: str) -> None:
-        self.blocking_segments = self._load_blocking_segments(wad_path, map_name)
+        self.blocking_segments, self.door_segments = self._load_blocking_segments(wad_path, map_name)
         if not self.blocking_segments:
             raise RuntimeError(f"No blocking linedefs found for map {map_name}.")
 
@@ -43,7 +60,10 @@ class WADCollisionMap:
         return lumps
 
     @staticmethod
-    def _load_blocking_segments(wad_path: Path, map_name: str) -> list[tuple[float, float, float, float]]:
+    def _load_blocking_segments(
+        wad_path: Path,
+        map_name: str,
+    ) -> tuple[list[tuple[float, float, float, float]], list[tuple[float, float, float, float]]]:
         raw = wad_path.read_bytes()
         lumps = WADCollisionMap._read_lump_directory(raw)
         map_name_u = map_name.upper()
@@ -68,18 +88,26 @@ class WADCollisionMap:
 
         l_off, l_size = local["LINEDEFS"]
         segments: list[tuple[float, float, float, float]] = []
+        door_segments: list[tuple[float, float, float, float]] = []
         for i in range(l_size // 14):
-            v1, v2, flags, _special, _tag, right, left = struct.unpack_from("<hhhhhhh", raw, l_off + i * 14)
+            v1, v2, flags, special, _tag, right, left = struct.unpack_from("<hhhhhhh", raw, l_off + i * 14)
             if v1 < 0 or v2 < 0 or v1 >= len(vertices) or v2 >= len(vertices):
-                continue
-            one_sided = right == -1 or left == -1
-            impassable = bool(flags & 0x0001)  # ML_BLOCKING
-            if not one_sided and not impassable:
                 continue
             x1, y1 = vertices[v1]
             x2, y2 = vertices[v2]
+            is_manual_door = int(special) in WADCollisionMap.DOOR_MANUAL_SPECIALS
+            if is_manual_door:
+                door_segments.append((x1, y1, x2, y2))
+            one_sided = right == -1 or left == -1
+            impassable = bool(flags & 0x0001)  # ML_BLOCKING
+            if is_manual_door:
+                # Manual door lines are handled by dynamic door gating in world-sim.
+                # Do not keep them in permanent static blockers.
+                continue
+            if not one_sided and not impassable:
+                continue
             segments.append((x1, y1, x2, y2))
-        return segments
+        return segments, door_segments
 
     @staticmethod
     def _point_segment_distance_sq(
@@ -121,11 +149,16 @@ class WADCollisionMap:
         y: float,
         radius: float,
         dynamic_circles: list[tuple[float, float, float]] | None = None,
+        extra_blocking_segments: list[tuple[float, float, float, float]] | None = None,
     ) -> bool:
         r2 = radius * radius
         for x1, y1, x2, y2 in self.blocking_segments:
             if self._point_segment_distance_sq(x, y, x1, y1, x2, y2) < r2:
                 return True
+        if extra_blocking_segments is not None:
+            for x1, y1, x2, y2 in extra_blocking_segments:
+                if self._point_segment_distance_sq(x, y, x1, y1, x2, y2) < r2:
+                    return True
         if dynamic_circles is not None:
             for cx, cy, cr in dynamic_circles:
                 rr = radius + cr
@@ -141,6 +174,7 @@ class WADCollisionMap:
         dy: float,
         radius: float,
         dynamic_circles: list[tuple[float, float, float]] | None = None,
+        extra_blocking_segments: list[tuple[float, float, float, float]] | None = None,
     ) -> tuple[float, float]:
         if abs(dx) < 1e-6 and abs(dy) < 1e-6:
             return x, y
@@ -156,7 +190,15 @@ class WADCollisionMap:
         cx = x
         cy = y
         for _ in range(steps):
-            nx, ny = self._resolve_motion_single_step(cx, cy, sx, sy, radius, dynamic_circles)
+            nx, ny = self._resolve_motion_single_step(
+                cx,
+                cy,
+                sx,
+                sy,
+                radius,
+                dynamic_circles,
+                extra_blocking_segments,
+            )
             if abs(nx - cx) < 1e-6 and abs(ny - cy) < 1e-6:
                 break
             cx, cy = nx, ny
@@ -170,19 +212,20 @@ class WADCollisionMap:
         dy: float,
         radius: float,
         dynamic_circles: list[tuple[float, float, float]] | None = None,
+        extra_blocking_segments: list[tuple[float, float, float, float]] | None = None,
     ) -> tuple[float, float]:
         if abs(dx) < 1e-6 and abs(dy) < 1e-6:
             return x, y
 
         nx = x + dx
         ny = y + dy
-        if not self._collides(nx, ny, radius, dynamic_circles):
+        if not self._collides(nx, ny, radius, dynamic_circles, extra_blocking_segments):
             return nx, ny
 
         x_only = (x + dx, y)
         y_only = (x, y + dy)
-        x_ok = not self._collides(x_only[0], x_only[1], radius, dynamic_circles)
-        y_ok = not self._collides(y_only[0], y_only[1], radius, dynamic_circles)
+        x_ok = not self._collides(x_only[0], x_only[1], radius, dynamic_circles, extra_blocking_segments)
+        y_ok = not self._collides(y_only[0], y_only[1], radius, dynamic_circles, extra_blocking_segments)
         if x_ok and y_ok:
             if abs(dx) >= abs(dy):
                 return x_only
@@ -195,13 +238,13 @@ class WADCollisionMap:
         for scale in (0.5, 0.33, 0.25, 0.125):
             sx = x + dx * scale
             sy = y + dy * scale
-            if not self._collides(sx, sy, radius, dynamic_circles):
+            if not self._collides(sx, sy, radius, dynamic_circles, extra_blocking_segments):
                 return sx, sy
             sx_only = x + dx * scale
             sy_only = y + dy * scale
-            if not self._collides(sx_only, y, radius, dynamic_circles):
+            if not self._collides(sx_only, y, radius, dynamic_circles, extra_blocking_segments):
                 return sx_only, y
-            if not self._collides(x, sy_only, radius, dynamic_circles):
+            if not self._collides(x, sy_only, radius, dynamic_circles, extra_blocking_segments):
                 return x, sy_only
 
         return x, y
@@ -767,6 +810,11 @@ class DoomTransformerLoop:
         self._world_last_bridge_x = np.nan
         self._world_last_bridge_y = np.nan
         self._world_last_bridge_angle = np.nan
+        self._last_player_cmd_x = np.nan
+        self._last_player_cmd_y = np.nan
+        self._last_player_cmd_angle = np.nan
+        self._last_player_cmd_fire = np.nan
+        self._last_player_cmd_use = np.nan
         self._latest_target_mask = np.zeros(self.enemy_target_mask_dim, dtype=np.float32)
         if self.enemy_target_mask_dim > 0:
             self._latest_target_mask[0] = 100.0
@@ -845,6 +893,8 @@ class DoomTransformerLoop:
             )
             else None
         )
+        door_count = len(self._collision_map.door_segments) if self._collision_map is not None else 0
+        self._world_door_open_ticks = np.zeros(door_count, dtype=np.int32)
 
     def _uses_doom_buttons_source(self) -> bool:
         return "doom_buttons" in self.keyboard_source
@@ -913,6 +963,11 @@ class DoomTransformerLoop:
             game.send_game_command(
                 f"set nn_enemy_combat_transformer {1 if self.config.enemy_combat_transformer else 0}"
             )
+            # Keep player override disabled in runtime for stability in pure path.
+            # Player pose is bridged via warp + native turn/fire/use deltas.
+            game.send_game_command("set nn_player_override 0")
+            game.send_game_command("set nn_player_fire_raw 0")
+            game.send_game_command("set nn_player_use_raw 0")
         game.new_episode()
         self._bind_keyboard_controls(game)
         return game
@@ -1897,7 +1952,7 @@ class DoomTransformerLoop:
     def _send_enemy_health_commands(self, slot: int, present_norm: float) -> None:
         health_raw = 0.0
         dead_raw = 1.0
-        if self.config.enemy_combat_transformer and not self.config.nn_world_sim:
+        if self.config.enemy_combat_transformer:
             alive = bool(self._world_enemies[slot, 4] > 0.5)
             health_raw = float(max(0.0, self._world_enemies[slot, 3]))
             dead_raw = 0.0 if alive else 1.0
@@ -1923,8 +1978,9 @@ class DoomTransformerLoop:
         sin_a = float(np.sin(angle_rad))
 
         step_scale = self.config.nn_move_units
-        dx = (cos_a * fwd - sin_a * side) * step_scale
-        dy = (sin_a * fwd + cos_a * side) * step_scale
+        # Side axis uses positive=right in control decode.
+        dx = (cos_a * fwd + sin_a * side) * step_scale
+        dy = (sin_a * fwd - cos_a * side) * step_scale
         tx = x + dx
         ty = y + dy
 
@@ -2178,6 +2234,46 @@ class DoomTransformerLoop:
     def _wrap_angle_deg(self, angle_deg: float) -> float:
         return float((angle_deg + 180.0) % 360.0 - 180.0)
 
+    def _world_update_manual_door_state(self, player_action: list[float]) -> None:
+        if self._collision_map is None or self._world_door_open_ticks.size == 0:
+            return
+        if np.any(self._world_door_open_ticks > 0):
+            self._world_door_open_ticks = np.maximum(self._world_door_open_ticks - 1, 0)
+
+        use_pressed = bool(len(player_action) > 5 and player_action[5] > 0.5)
+        if not use_pressed:
+            return
+
+        px = float(self._world_player[0])
+        py = float(self._world_player[1])
+        pang = float(self._world_player[2])
+        prad = np.deg2rad(pang)
+        fx = float(np.cos(prad))
+        fy = float(np.sin(prad))
+
+        max_d2 = 64.0 * 64.0
+        open_window = max(32, int(round(4.0 * self.config.doom_ticrate)))
+        for idx, (x1, y1, x2, y2) in enumerate(self._collision_map.door_segments):
+            d2 = WADCollisionMap._point_segment_distance_sq(px, py, x1, y1, x2, y2)
+            if d2 > max_d2:
+                continue
+            mx = 0.5 * (x1 + x2)
+            my = 0.5 * (y1 + y2)
+            # Keep "use" interaction front-facing.
+            facing = (mx - px) * fx + (my - py) * fy
+            if facing < -12.0:
+                continue
+            self._world_door_open_ticks[idx] = max(self._world_door_open_ticks[idx], open_window)
+
+    def _world_active_manual_door_blockers(self) -> list[tuple[float, float, float, float]] | None:
+        if self._collision_map is None or self._world_door_open_ticks.size == 0:
+            return None
+        blocked: list[tuple[float, float, float, float]] = []
+        for idx, seg in enumerate(self._collision_map.door_segments):
+            if self._world_door_open_ticks[idx] <= 0:
+                blocked.append(seg)
+        return blocked
+
     def _world_sim_bootstrap(self, slot_enemies: list[object | None] | None = None) -> None:
         if slot_enemies is None:
             state = self.game.get_state()
@@ -2210,6 +2306,8 @@ class DoomTransformerLoop:
             self._world_enemies[slot, 4] = 1.0
         self._world_kills = 0
         self._world_sim_tick = 0
+        if self._world_door_open_ticks.size > 0:
+            self._world_door_open_ticks.fill(0)
         self._world_last_bridge_x = np.nan
         self._world_last_bridge_y = np.nan
         self._world_last_bridge_angle = np.nan
@@ -2238,6 +2336,7 @@ class DoomTransformerLoop:
             self._world_sim_bootstrap()
         sim_sub_steps = max(1, self.config.action_repeat if sub_steps is None else sub_steps)
         for _ in range(sim_sub_steps):
+            self._world_update_manual_door_state(player_action)
             # Player world-sim kinematics can conflict with native visible player
             # grounding/physics; keep it optional.
             if use_player_kinematics:
@@ -2270,13 +2369,15 @@ class DoomTransformerLoop:
                 prad = np.deg2rad(pangle)
                 cos_a = float(np.cos(prad))
                 sin_a = float(np.sin(prad))
-                pdx = (cos_a * move_norm - sin_a * strafe_norm) * self.config.nn_move_units * strict_move_scale
-                pdy = (sin_a * move_norm + cos_a * strafe_norm) * self.config.nn_move_units * strict_move_scale
+                # Strafe convention: positive strafe_norm means "right".
+                pdx = (cos_a * move_norm + sin_a * strafe_norm) * self.config.nn_move_units * strict_move_scale
+                pdy = (sin_a * move_norm - cos_a * strafe_norm) * self.config.nn_move_units * strict_move_scale
                 if self._collision_map is not None:
                     # Use static-map collision only for player in world-sim mode.
                     # Enemy dynamic blockers can drift from rendered Doom actors until
                     # full actor-state bridging is implemented, causing "invisible wall" feel.
                     dyn: list[tuple[float, float, float]] = []
+                    extra_segments = self._world_active_manual_door_blockers()
                     npx, npy = self._collision_map.resolve_motion(
                         px,
                         py,
@@ -2284,6 +2385,7 @@ class DoomTransformerLoop:
                         pdy,
                         radius=self.config.nn_player_radius,
                         dynamic_circles=dyn,
+                        extra_blocking_segments=extra_segments,
                     )
                     self._world_player[0] = float(npx)
                     self._world_player[1] = float(npy)
@@ -2431,29 +2533,38 @@ class DoomTransformerLoop:
         px = float(self._world_player[0])
         py = float(self._world_player[1])
         pang = float(self._world_player[2])
-        if (
+        first_bridge = (
             np.isnan(self._world_last_bridge_x)
             or np.isnan(self._world_last_bridge_y)
             or np.isnan(self._world_last_bridge_angle)
-        ):
-            do_bridge = True
+        )
+        if first_bridge:
+            pos_changed = True
+            ang_changed = True
         else:
-            do_bridge = (
+            pos_changed = (
                 abs(px - float(self._world_last_bridge_x)) > 0.08
                 or abs(py - float(self._world_last_bridge_y)) > 0.08
-                or abs(self._wrap_angle_deg(pang - float(self._world_last_bridge_angle))) > 0.20
             )
+            ang_changed = abs(self._wrap_angle_deg(pang - float(self._world_last_bridge_angle))) > 0.20
         # Keep visible player motion native by default. In strict+pure mode, bridge
         # visible player from world-sim state as well.
         bridge_player = (not self.config.visible) or (
             self.config.nn_world_sim_strict and self.config.nn_world_sim_pure
         )
-        if do_bridge and bridge_player:
-            # VizDoom reliably supports warp x y. Variants with extra args can be ignored.
-            self.game.send_game_command(f"warp {px:.3f} {py:.3f}")
-            self._world_last_bridge_x = px
-            self._world_last_bridge_y = py
-            self._world_last_bridge_angle = pang
+        if bridge_player:
+            if pos_changed:
+                # Use warp x y only; warp x y z is ignored on this runtime path.
+                self.game.send_game_command(f"warp {px:.3f} {py:.3f}")
+                if self.config.nn_world_sim_strict and self.config.nn_world_sim_pure:
+                    # `warp x y` can collapse camera view-height in Doom player mode.
+                    # Re-center view each pure-bridge warp so the player does not
+                    # visually sink into the floor while moving.
+                    self.game.send_game_command("centerview")
+            if pos_changed or ang_changed:
+                self._world_last_bridge_x = px
+                self._world_last_bridge_y = py
+                self._world_last_bridge_angle = pang
         if not self.config.enemy_backend_transformer:
             return
         for slot in range(self.config.enemy_slots):
@@ -2773,7 +2884,7 @@ class DoomTransformerLoop:
         use_player_kinematics = self.config.nn_world_sim_strict and not strict_visible_native_player
 
         # Keep Doom ticking for rendering while Transformer world-sim owns movement/combat.
-        sub_total = max(1, self.config.action_repeat)
+        sub_total = 1 if self.config.nn_world_sim_pure else max(1, self.config.action_repeat)
         for sub_tick in range(sub_total):
             if sub_tick > 0:
                 keyboard_state = self._sanitize_keyboard_state(self._read_keyboard_state())
@@ -2783,6 +2894,40 @@ class DoomTransformerLoop:
                 decoded_action = self._decode_controls(control_logits, step, keyboard_state)
                 action = decoded_action.copy()
                 self._apply_fire_cooldown(action, keyboard_state)
+            else:
+                decoded_action = neutral_action.copy()
+                action = neutral_action.copy()
+
+            if self.config.nn_world_sim_strict and self.config.nn_world_sim_pure:
+                # Pure strict mode: world-sim owns movement/combat state.
+                # Runtime bridge executes XY via warp, and turn/look/fire/use via native deltas.
+                self._world_sim_step(
+                    action,
+                    enemy_commands,
+                    sub_steps=1,
+                    use_player_kinematics=True,
+                )
+                self._world_sim_apply_render_bridge()
+                pure_bridge_action = [0.0] * self.control_dim
+                pure_bridge_action[2] = float(action[2])  # turn
+                pure_bridge_action[3] = float(action[3])  # look
+                pure_bridge_action[4] = float(action[4])  # fire pulse
+                pure_bridge_action[5] = float(action[5])  # use
+                total_reward += self.game.make_action(pure_bridge_action, 1)
+                if self.config.visible:
+                    # `warp x y` transiently collapses view-height for one tick in player mode.
+                    # Consume one neutral recovery tick before rendering so camera stays stable.
+                    total_reward += self.game.make_action(neutral_action, 1)
+                    # Some lower-floor sector transitions need one extra recovery tick
+                    # to restore full view-height (otherwise the player appears half-sunk).
+                    if float(self._safe_game_variable("VIEW_HEIGHT", 41.0)) < 35.0:
+                        total_reward += self.game.make_action(neutral_action, 1)
+                self._sync_world_player_from_doom()
+                last_action = decoded_action
+                self._render_current_frame()
+                continue
+
+            if np.any(keyboard_state > 0.1):
                 if self.config.nn_world_sim_strict:
                     # Visible strict mode: use Transformer-decoded native movement/turn deltas
                     # to keep Doom floor/collision rendering stable; keep firing world-sim only.
@@ -2796,8 +2941,10 @@ class DoomTransformerLoop:
                         strict_bridge_action[5] = float(action[5])  # use
                         total_reward += self.game.make_action(strict_bridge_action, 1)
                     else:
-                        # Headless strict: never inject native Doom movement/fire.
-                        self._strict_update_turn_hold(action, keyboard_state)
+                        # Pure strict world-sim (visible or headless): never inject native
+                        # movement/fire. Turn/view comes from Transformer bridge state.
+                        if not self.config.nn_world_sim_pure:
+                            self._strict_update_turn_hold(action, keyboard_state)
                         total_reward += self.game.make_action(neutral_action, 1)
                 else:
                     total_reward += self._make_action_with_fire_pulse(action, repeats=1)
@@ -2806,7 +2953,11 @@ class DoomTransformerLoop:
                     self._world_player[2] = self._wrap_angle_deg(
                         float(self.game.get_game_variable(GameVariable.ANGLE))
                     )
-                if strict_visible_native_player or (not use_player_kinematics):
+                if (
+                    strict_visible_native_player
+                    or (not use_player_kinematics)
+                    or (self.config.nn_world_sim_pure and self.config.visible)
+                ):
                     self._sync_world_player_from_doom()
                 self._world_sim_step(
                     action,
@@ -2817,10 +2968,15 @@ class DoomTransformerLoop:
                 last_action = decoded_action
             else:
                 if self.config.nn_world_sim_strict and not strict_visible_native_player:
-                    self._strict_update_turn_hold(neutral_action, keyboard_state)
+                    if not self.config.nn_world_sim_pure:
+                        self._strict_update_turn_hold(neutral_action, keyboard_state)
                 total_reward += self.game.make_action(neutral_action, 1)
                 self._world_player_z = float(self._safe_game_variable("POSITION_Z", self._world_player_z))
-                if strict_visible_native_player or (not use_player_kinematics):
+                if (
+                    strict_visible_native_player
+                    or (not use_player_kinematics)
+                    or (self.config.nn_world_sim_pure and self.config.visible)
+                ):
                     self._sync_world_player_from_doom()
                 self._world_sim_step(
                     neutral_action,
@@ -2898,14 +3054,19 @@ class DoomTransformerLoop:
             )
             if self.config.nn_world_sim_strict:
                 print(
-                    "Strict world-sim execution is ON: player movement/fire are not sent to native Doom; "
-                    "Transformer world state is bridged to render."
+                    "Strict world-sim execution is ON: player movement is Transformer-side; "
+                    "Doom is used as render/IO bridge."
                 )
                 if self.config.nn_world_sim_pure:
                     print(
-                        "Pure strict mode is ON: player world execution stays in Transformer "
-                        "(Doom native player movement solver path is bypassed)."
+                        "Pure strict mode is ON: movement/position resolve in Transformer; "
+                        "native Doom receives only turn/look/fire/use deltas."
                     )
+                    if self._world_door_open_ticks.size > 0:
+                        print(
+                            "Pure mode door guard is ON: manual door linedefs block movement "
+                            "until Use (E) opens a short pass window."
+                        )
             print(
                 f"NN world-sim damage scale: {self.config.nn_world_damage_scale:.2f}"
             )
@@ -3176,7 +3337,7 @@ def parse_args() -> EmulationConfig:
     parser.add_argument(
         "--resolution",
         type=str,
-        default="1024x768",
+        default="1280x960",
         help="Render resolution as WIDTHxHEIGHT, e.g. 1280x960",
     )
     parser.add_argument("--context", type=int, default=32, help="Transformer context length")
@@ -3191,7 +3352,7 @@ def parse_args() -> EmulationConfig:
     parser.add_argument(
         "--keyboard-source",
         type=str,
-        default="auto",
+        default="pygame_window",
         choices=["auto", "macos_global", "doom_buttons", "pygame_window"],
         help="Keyboard source: auto, macos_global, doom_buttons, or pygame_window.",
     )
@@ -3202,7 +3363,7 @@ def parse_args() -> EmulationConfig:
         choices=["cpu", "cuda"],
         help="Torch device",
     )
-    parser.add_argument("--log-interval", type=int, default=35, help="Ticks between metric logs")
+    parser.add_argument("--log-interval", type=int, default=1, help="Ticks between metric logs")
     parser.add_argument(
         "--max-ticks",
         type=int,
@@ -3266,11 +3427,18 @@ def parse_args() -> EmulationConfig:
     )
     parser.add_argument(
         "--enemy-backend-transformer",
+        dest="enemy_backend_transformer",
         action="store_true",
         help=(
             "Enable experimental enemy backend override via custom scenario mod and "
             "Transformer enemy command head."
         ),
+    )
+    parser.add_argument(
+        "--disable-enemy-backend-transformer",
+        dest="enemy_backend_transformer",
+        action="store_false",
+        help="Disable Transformer enemy backend override.",
     )
     parser.add_argument(
         "--enemy-backend-mod",
@@ -3294,6 +3462,7 @@ def parse_args() -> EmulationConfig:
     )
     parser.add_argument(
         "--enemy-kinematics-transformer",
+        dest="enemy_kinematics_transformer",
         action="store_true",
         help=(
             "Move enemy kinematic state update (x/y/angle integration) to Transformer-side backend "
@@ -3301,12 +3470,25 @@ def parse_args() -> EmulationConfig:
         ),
     )
     parser.add_argument(
+        "--disable-enemy-kinematics-transformer",
+        dest="enemy_kinematics_transformer",
+        action="store_false",
+        help="Disable Transformer-side enemy kinematics update path.",
+    )
+    parser.add_argument(
         "--enemy-combat-transformer",
+        dest="enemy_combat_transformer",
         action="store_true",
         help=(
             "Move enemy hit resolution + damage/death transitions to Transformer-side backend "
             "(mod executes only health/death writes)."
         ),
+    )
+    parser.add_argument(
+        "--disable-enemy-combat-transformer",
+        dest="enemy_combat_transformer",
+        action="store_false",
+        help="Disable Transformer-side enemy combat hit/health transition path.",
     )
     parser.add_argument(
         "--nn-movement-resolution",
@@ -3323,7 +3505,15 @@ def parse_args() -> EmulationConfig:
         action="store_false",
         help="Disable Transformer-side movement/collision resolution and use native Doom movement.",
     )
-    parser.set_defaults(nn_movement_resolution=True)
+    parser.set_defaults(
+        nn_movement_resolution=True,
+        enemy_backend_transformer=True,
+        enemy_kinematics_transformer=True,
+        enemy_combat_transformer=True,
+        nn_world_sim=True,
+        nn_world_sim_strict=True,
+        nn_world_sim_pure=True,
+    )
     parser.add_argument(
         "--nn-move-units",
         type=float,
@@ -3362,6 +3552,7 @@ def parse_args() -> EmulationConfig:
     )
     parser.add_argument(
         "--nn-world-sim",
+        dest="nn_world_sim",
         action="store_true",
         help=(
             "Experimental mode: move low-level movement/collision/combat step into Transformer-side "
@@ -3369,7 +3560,14 @@ def parse_args() -> EmulationConfig:
         ),
     )
     parser.add_argument(
+        "--disable-nn-world-sim",
+        dest="nn_world_sim",
+        action="store_false",
+        help="Disable Transformer world-sim stepping path.",
+    )
+    parser.add_argument(
         "--nn-world-sim-strict",
+        dest="nn_world_sim_strict",
         action="store_true",
         help=(
             "Strict world-sim execution: do not send player movement/fire to native Doom; "
@@ -3377,12 +3575,25 @@ def parse_args() -> EmulationConfig:
         ),
     )
     parser.add_argument(
+        "--disable-nn-world-sim-strict",
+        dest="nn_world_sim_strict",
+        action="store_false",
+        help="Disable strict world-sim execution mode.",
+    )
+    parser.add_argument(
         "--nn-world-sim-pure",
+        dest="nn_world_sim_pure",
         action="store_true",
         help=(
             "With --nn-world-sim-strict, keep visible player world execution in Transformer as well "
             "(no native Doom player movement solver path)."
         ),
+    )
+    parser.add_argument(
+        "--disable-nn-world-sim-pure",
+        dest="nn_world_sim_pure",
+        action="store_false",
+        help="Disable pure world-sim execution mode.",
     )
     parser.add_argument(
         "--nn-world-damage-scale",
@@ -3396,12 +3607,9 @@ def parse_args() -> EmulationConfig:
     if args.nn_world_sim_pure and not args.nn_world_sim_strict:
         args.nn_world_sim_strict = True
         args.nn_world_sim = True
-    if args.nn_world_sim_pure and not args.headless:
-        raise ValueError(
-            "--nn-world-sim-pure is currently headless-only. "
-            "Visible pure mode breaks player/world bridge stability in VizDoom. "
-            "Use --headless for pure mode, or remove --nn-world-sim-pure for visible runs."
-        )
+    if args.headless and args.keyboard_source == "pygame_window":
+        # pygame window sampling requires a visible window; fall back automatically.
+        args.keyboard_source = "doom_buttons"
     if args.enemy_kinematics_transformer and not args.enemy_backend_transformer:
         raise ValueError("--enemy-kinematics-transformer requires --enemy-backend-transformer.")
     if args.enemy_combat_transformer and not args.enemy_backend_transformer:

@@ -12,8 +12,29 @@ This project runs **the original Doom backend and graphics** through VizDoom usi
 From `/Users/kimonfountoulakis/Documents/VizDOOM_second_attempt`:
 
 ```bash
+./run_pure.sh
+```
+
+`run_pure.sh` is the recommended one-command launcher for the current pure authoritative profile.
+It rebuilds the mod and starts the game with pure world-sim defaults.
+You can pass extra CLI args through it, e.g. `./run_pure.sh --max-ticks 5000`.
+
+Equivalent manual launch:
+
+```bash
+python3 build_enemy_nn_mod.py
 python3 e1m1_transformer_backend.py --wad DOOM.WAD --map E1M1
 ```
+
+Default profile is now "most-authoritative Transformer":
+- `--resolution 1280x960`
+- `--keyboard-source pygame_window`
+- `--enemy-backend-transformer --enemy-kinematics-transformer --enemy-combat-transformer`
+- `--nn-world-sim --nn-world-sim-strict --nn-world-sim-pure`
+
+Use `--disable-enemy-backend-transformer`, `--disable-enemy-kinematics-transformer`,
+`--disable-enemy-combat-transformer`, `--disable-nn-world-sim`,
+`--disable-nn-world-sim-strict`, or `--disable-nn-world-sim-pure` to opt out.
 
 Useful flags:
 
@@ -63,6 +84,9 @@ python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-
 
 # Pure strict world-execution: visible player world execution also stays in Transformer
 python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-mod enemy_nn_backend_mod.pk3 --nn-world-sim --nn-world-sim-strict --nn-world-sim-pure --nn-world-damage-scale 1.0
+
+# One-command pure launcher (recommended)
+./run_pure.sh
 
 # Headless regression runner (parses and checks enemy metrics)
 python3 run_enemy_regression.py --wad DOOM.WAD --enemy-backend-mod enemy_nn_backend_mod.pk3 --max-ticks 5000
@@ -149,14 +173,16 @@ This section is the current authority map for the runtime backend.
   - Command ownership at execution remains actor-id keyed in the mod.
   - In no-world-sim mode, slot assignment uses canonical observation keys + global memory-key matching (order-invariant, no frame-order dependence).
 - By default, Doom remains authoritative for rendering and core simulation (physics, collisions, damage, doors/triggers, pickups, map logic).
-- With `--nn-world-sim` (experimental), low-level movement/collision/combat are stepped in Transformer-side Python state and bridged back into Doom each tick (`warp`/`setangle` + enemy health sync).
+- With `--nn-world-sim` (experimental), low-level movement/collision/combat are stepped in Transformer-side Python state and bridged back into Doom each tick.
 - With `--nn-world-sim-strict`, player movement/fire are not sent to native Doom; Transformer world state drives player bridge (more model-authoritative, less stable).
   - In visible strict mode, keyboard sampling must come from `macos_global+doom_buttons` or `pygame_window` (plain `doom_buttons` is auto-upgraded/fails-fast).
   - Strict bridge uses `warp x y` (not `warp x y z`) for reliable VizDoom execution.
   - Native Doom movement/fire binds are disabled in strict mode to avoid double-driving and visual/collision glitches.
   - Visible strict mode now applies Transformer-decoded movement/turn deltas through Doom (no visible player warp), while keeping firing world-sim-side.
 - With `--nn-world-sim-pure` (implies strict), visible player execution is also Transformer-side (Doom player movement solver bypassed).
-  - Current limitation: `--nn-world-sim-pure` is headless-only; visible pure mode is not stable in VizDoom bridge yet.
+  - In visible pure mode, player x/y is bridged with `warp`; turn/look/fire/use are sent as native action deltas from Transformer-decoded controls.
+  - Pure bridge applies recovery ticks to keep camera/view-height stable across warp and lower-floor transitions.
+  - Manual doors are guarded in Transformer collision: closed doors block movement until `Use` (`E`) opens a short pass window.
 
 ### 2. Exact architecture and its parameters
 
@@ -217,6 +243,7 @@ Per tick, one `state_in` vector is built and then stacked over time (`context=32
 ## Important behavior
 
 - Gameplay and visuals are rendered by **VizDoom + your `DOOM.WAD`**, which preserves original E1M1 content and interactions.
+- Recommended launcher is `./run_pure.sh` for the pure authoritative profile.
 - The game runs in `PLAYER` mode and the Transformer is authoritative for player controls each tick (`movement`, `aim`, `fire`, `use`) via `make_action`.
 - Keyboard input is read each tick and fed into Transformer control decoding (`W/S/A/D`, arrows, fire/use).
 - Startup enforces key binds: `W/S/A/D`, `Left/Right/Up/Down`, `Space` (attack), `E` (use). (`Z/Q` are also accepted for AZERTY layouts).
@@ -236,6 +263,7 @@ Per tick, one `state_in` vector is built and then stacked over time (`context=32
 - `--action-repeat` controls movement/turn speed by applying each decoded action for multiple VizDoom ticks (default `5`).
 - Movement/turn speed is independently tunable with `--move-delta`, `--strafe-delta`, `--turn-delta`.
 - Holding fire is rate-limited by `--fire-cooldown-tics`, and attack is pulsed for one tick so high action-repeat does not overfire.
+- In pure strict mode, closed manual doors block movement in Transformer collision until `E` (`Use`) opens a short pass window.
 - Enemy/world pace is tunable with `--doom-ticrate` (lower = slower) and `--doom-skill`.
 - Classic Doom HUD/status bar is forced (`hud_althud 0`, `screenblocks 10`, `set_render_hud(True)`).
 - The Transformer predicts both:
