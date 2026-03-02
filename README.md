@@ -58,6 +58,12 @@ python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-
 # Experimental: move low-level movement/collision/combat into NN world simulator
 python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-mod enemy_nn_backend_mod.pk3 --nn-world-sim --nn-world-damage-scale 1.0
 
+# Strict world-execution experiment: player movement/fire are Transformer-world-sim authoritative
+python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-mod enemy_nn_backend_mod.pk3 --nn-world-sim --nn-world-sim-strict --nn-world-damage-scale 1.0
+
+# Pure strict world-execution: visible player world execution also stays in Transformer
+python3 e1m1_transformer_backend.py --enemy-backend-transformer --enemy-backend-mod enemy_nn_backend_mod.pk3 --nn-world-sim --nn-world-sim-strict --nn-world-sim-pure --nn-world-damage-scale 1.0
+
 # Headless regression runner (parses and checks enemy metrics)
 python3 run_enemy_regression.py --wad DOOM.WAD --enemy-backend-mod enemy_nn_backend_mod.pk3 --max-ticks 5000
 # quick one-off (no mandatory release-suite expansion)
@@ -74,20 +80,63 @@ python3 run_enemy_regression.py --wad DOOM.WAD --enemy-backend-mod enemy_nn_back
 
 ## Transformer Backend Details
 
+### 0. Current Transformer Authority (What It Handles Right Now)
+
+This section is the current authority map for the runtime backend.
+
+- Always Transformer-handled (all modes):
+  - Builds `state_in` every tick from game variables, pooled frame features, keyboard features, enemy observation tokens, and enemy memory features.
+  - Runs the hardcoded Transformer forward pass every tick (`state_out`, control, enemy heads, low-level head, memory-update head).
+  - Decodes player controls from keyboard + `control_logits` (keyboard decides intent; Transformer modulates strength and resolves key conflicts).
+  - Applies player fire pulse/cooldown logic in the loop (`_apply_fire_cooldown` + `_make_action_with_fire_pulse`).
+  - Updates low-level runtime knobs from `low_level_logits` (move scale, turn scale, fire cooldown scale).
+  - Updates per-slot enemy latent memory from `memory_update_logits` (gate + delta).
+
+- Additional Transformer authority with `--enemy-backend-transformer`:
+  - Uses `enemy_bind_logits` to bind slot memory to observed enemy tokens (one-to-one assignment with safe Hungarian solve).
+  - Uses `enemy_target_logits` to decode per-slot target selection (player token or observed actor token), then transports actor-id targets to the mod.
+  - Uses `enemy_actuator_logits` as final per-slot actuation channels (`speed/fwd/side/turn/aim/fire/firecd/health`), bounded only for crash safety.
+  - Decodes enemy fire cadence in Transformer-side state (`_decode_enemy_fire_pulse` phase/threshold state), then sends pulse command to mod.
+
+- Additional Transformer authority with `--enemy-kinematics-transformer`:
+  - Integrates enemy x/y/angle in Transformer-side state each tick.
+  - Resolves enemy movement collisions against map geometry + dynamic circles (player + other enemies).
+  - Sends absolute enemy kinematic commands (`x_raw`, `y_raw`, `angle_raw`) to execution mod.
+  - Note: current CLI wiring auto-enables `enemy_combat_transformer` when `enemy_kinematics_transformer` is enabled.
+
+- Additional Transformer authority with `--enemy-combat-transformer` (no world-sim):
+  - Resolves player -> enemy hit logic in Transformer state (LOS, aim tolerance, distance, cooldown).
+  - Resolves enemy -> player hit logic in Transformer state (fire pulse, target-to-player gate, LOS, aim tolerance, distance).
+  - Owns enemy health/alive transitions in Transformer state and sends `health_raw`/`dead_raw` to mod.
+  - Owns player health/death transitions in Transformer state and syncs to Doom via `sethealth` / `kill`.
+
+- Additional Transformer authority with `--nn-world-sim`:
+  - Steps a Transformer-side world state loop for player/enemy kinematics and simplified combat.
+  - Bridges world state back to Doom for rendering (`warp`/angle bridge + command sync).
+  - In this mode, no-world-sim combat path (`_transformer_enemy_combat_step`) is bypassed and world-sim combat path is used instead.
+
+- Still handled by Doom/mod in normal (non-world-sim) gameplay:
+  - Doom remains renderer and core map runtime (sectors/doors/triggers/pickups/hud rendering and native tick execution).
+  - Execution mod applies transported enemy commands to live actors (movement/angle/target/fire state call + health/death write).
+  - Full native actor/world internals (projectiles, full physics, animation/state machine details outside overridden channels) remain engine-side.
+
 ### 1. How the Transformer is used in the backend
 
 - The Transformer runs every tick on a temporal state window (`context=32`) and outputs:
   - `state_out` (predicted next backend state vector).
   - `control_logits` (decoded into Doom control actions).
-  - `enemy_logits` (per-slot behavior head; authoritative direct `target_actor_id_raw` command).
+  - `enemy_logits` (legacy behavior/diagnostic head; not the final target authority path).
+  - `enemy_bind_logits` (per-slot binding logits over observed enemy tokens + empty token).
+  - `enemy_target_logits` (per-slot target logits over player token + observed enemy tokens).
   - `enemy_actuator_logits` (per-slot final actuator commands: `speed/fwd/side/turn/aim/fire/firecd/health`).
   - `low_level_logits` (non-standard backend knobs for player dynamics).
   - `memory_update_logits` (per-slot memory update channels: gate + delta for persistent enemy latent state).
 - The player action sent to Doom is computed from Transformer logits each tick (keyboard-gated, NN-modulated strength/conflict resolution).
 - In `--enemy-backend-transformer` mode, the loop also sends per-slot enemy commands to a custom mod (`enemy_nn_backend_mod.pk3`) each tick:
   - Transformer behavior channels are decoded into backend actuation:
-    - behavior channels: minimal authoritative direct `target_actor_id_raw` command (per slot).
-    - per-slot target selection is decoded as direct actor-id command with range safety clamp only.
+    - behavior head is legacy/compatibility-only in current path.
+    - per-slot target selection comes from `enemy_target_logits` and is transported as direct actor-id command (`target_actor_id_raw`) with range-safe transport only.
+    - per-slot observation-to-memory binding comes from `enemy_bind_logits`.
     - final backend actuation is fully direct from final actuator channels with hard safety bounds only
     - actuation channels sent to Doom/mod are normalized float cvars: `speed_norm`, `fwd_norm`, `side_norm`, `turn_norm`, `aim_norm`, `fire_norm`, `firecd_norm`, `health_norm`, `present_norm`, plus direct actor-id cvars `actor_id_raw` and `target_actor_id_raw`
   - aiming/firing/timing are decoded directly from actuator channels (`act_aim_norm`, `act_fire_norm`, `act_firecd_norm`) and passed to the mod as normalized floats.
@@ -98,8 +147,16 @@ python3 run_enemy_regression.py --wad DOOM.WAD --enemy-backend-mod enemy_nn_back
 - Per-enemy memory latent channels are enabled (`memory_dim=4`) and updated by Transformer memory outputs (gate + 4-delta).
   - Slot identity persistence is reorder-robust via model-memory slot binding, instead of raw observation order.
   - Command ownership at execution remains actor-id keyed in the mod.
+  - In no-world-sim mode, slot assignment uses canonical observation keys + global memory-key matching (order-invariant, no frame-order dependence).
 - By default, Doom remains authoritative for rendering and core simulation (physics, collisions, damage, doors/triggers, pickups, map logic).
 - With `--nn-world-sim` (experimental), low-level movement/collision/combat are stepped in Transformer-side Python state and bridged back into Doom each tick (`warp`/`setangle` + enemy health sync).
+- With `--nn-world-sim-strict`, player movement/fire are not sent to native Doom; Transformer world state drives player bridge (more model-authoritative, less stable).
+  - In visible strict mode, keyboard sampling must come from `macos_global+doom_buttons` or `pygame_window` (plain `doom_buttons` is auto-upgraded/fails-fast).
+  - Strict bridge uses `warp x y` (not `warp x y z`) for reliable VizDoom execution.
+  - Native Doom movement/fire binds are disabled in strict mode to avoid double-driving and visual/collision glitches.
+  - Visible strict mode now applies Transformer-decoded movement/turn deltas through Doom (no visible player warp), while keeping firing world-sim-side.
+- With `--nn-world-sim-pure` (implies strict), visible player execution is also Transformer-side (Doom player movement solver bypassed).
+  - Current limitation: `--nn-world-sim-pure` is headless-only; visible pure mode is not stable in VizDoom bridge yet.
 
 ### 2. Exact architecture and its parameters
 
@@ -112,7 +169,9 @@ python3 run_enemy_regression.py --wad DOOM.WAD --enemy-backend-mod enemy_nn_back
 - Output heads:
   - `state_out_proj`: `Linear(256 -> state_dim)`.
   - `control_out_proj`: `Linear(256 -> 6)`.
-  - `enemy_out_proj`: `Linear(256 -> enemy_slots * enemy_cmd_dim)` (default `16 * 1`; per-slot direct `target_actor_id_raw`).
+  - `enemy_out_proj`: `Linear(256 -> enemy_slots * enemy_cmd_dim)` (default `16 * 1`; legacy behavior/diagnostic path).
+  - `enemy_bind_out_proj`: `Linear(256 -> enemy_slots * enemy_bind_dim)` (default `16 * 17`; bind over 16 obs tokens + empty).
+  - `enemy_target_out_proj`: `Linear(256 -> enemy_slots * enemy_target_dim)` (default `16 * 17`; target over player + 16 obs tokens).
   - `enemy_actuator_out_proj`: `Linear(256 -> enemy_slots * enemy_actuator_dim)` (default `16 * 8`; per-slot `speed/fwd/side/turn/aim/fire/firecd/health`).
   - `low_level_out_proj`: `Linear(256 -> low_level_dim)` where `low_level_dim = 4 + enemy_slots * 1` (default `20`).
   - `memory_out_proj`: `Linear(256 -> enemy_slots * memory_update_dim)` where `memory_update_dim = 1 + memory_dim` (default `5` = gate + 4-delta).
