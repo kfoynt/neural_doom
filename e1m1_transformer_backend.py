@@ -332,9 +332,14 @@ class PygameKeyboardSampler:
         self._pg.init()
         self._width = width
         self._height = height
+        self._diag_panel_width = 460
+        self._show_diagnostics = False
         self._window = self._pg.display.set_mode((width, height))
         self._pg.display.set_caption("Transformer Doom (focus this window)")
         self._pressed_keys: set[int] = set()
+        self._font = self._pg.font.SysFont("Menlo", 16)
+        self._small_font = self._pg.font.SysFont("Menlo", 13)
+        self._diag_toggle_tick = 0
         self.closed = False
 
     def read(self) -> np.ndarray:
@@ -343,6 +348,13 @@ class PygameKeyboardSampler:
                 self.closed = True
                 self._pressed_keys.clear()
             elif event.type == self._pg.KEYDOWN:
+                if int(event.key) == int(self._pg.K_F1):
+                    now = self._pg.time.get_ticks()
+                    if now - self._diag_toggle_tick < 120:
+                        continue
+                    self._diag_toggle_tick = now
+                    self._show_diagnostics = not self._show_diagnostics
+                    continue
                 self._pressed_keys.add(int(event.key))
             elif event.type == self._pg.KEYUP:
                 self._pressed_keys.discard(int(event.key))
@@ -407,14 +419,123 @@ class PygameKeyboardSampler:
             dtype=np.float32,
         )
 
-    def render_rgb_frame(self, frame: np.ndarray) -> None:
+    def _ensure_window_shape(self, diagnostics_active: bool) -> None:
+        target_w = self._width + (self._diag_panel_width if diagnostics_active else 0)
+        current_w, current_h = self._window.get_size()
+        if current_w != target_w or current_h != self._height:
+            self._window = self._pg.display.set_mode((target_w, self._height))
+
+    def _draw_text(self, surface: object, text: str, x: int, y: int, small: bool = False) -> None:
+        font = self._small_font if small else self._font
+        surface.blit(font.render(text, True, (220, 220, 220)), (x, y))
+
+    def _draw_control_bars(self, panel: object, control: np.ndarray, x: int, y: int, w: int, h: int) -> None:
+        labels = ["fwd", "side", "turn", "look", "fire", "use"]
+        rows = min(len(labels), int(control.size))
+        if rows <= 0:
+            return
+        row_h = max(10, h // rows)
+        for i in range(rows):
+            yy = y + i * row_h
+            val = float(np.clip(control[i], -1.0, 1.0))
+            self._draw_text(panel, f"{labels[i]} {val:+.2f}", x, yy, small=True)
+            bar_x = x + 110
+            bar_y = yy + 2
+            bar_w = w - 120
+            bar_h = max(6, row_h - 6)
+            self._pg.draw.rect(panel, (65, 65, 65), (bar_x, bar_y, bar_w, bar_h), border_radius=3)
+            zero_x = bar_x + bar_w // 2
+            self._pg.draw.line(panel, (120, 120, 120), (zero_x, bar_y), (zero_x, bar_y + bar_h), 1)
+            fill_w = int(abs(val) * (bar_w // 2))
+            if fill_w <= 0:
+                continue
+            if val >= 0:
+                self._pg.draw.rect(
+                    panel,
+                    (90, 190, 120),
+                    (zero_x, bar_y, fill_w, bar_h),
+                    border_radius=3,
+                )
+            else:
+                self._pg.draw.rect(
+                    panel,
+                    (210, 120, 90),
+                    (zero_x - fill_w, bar_y, fill_w, bar_h),
+                    border_radius=3,
+                )
+
+    def _draw_attention_grid(
+        self,
+        panel: object,
+        attention: np.ndarray,
+        x: int,
+        y: int,
+        cell_w: int,
+        cell_h: int,
+    ) -> None:
+        if attention.ndim != 3 or attention.shape[0] <= 0:
+            self._draw_text(panel, "No attention tensors", x, y)
+            return
+        heads_to_draw = min(4, attention.shape[0])
+        cols = 2
+        rows = 2
+        for idx in range(heads_to_draw):
+            r = idx // cols
+            c = idx % cols
+            hx = x + c * (cell_w + 8)
+            hy = y + r * (cell_h + 26)
+            mat = np.asarray(attention[idx], dtype=np.float32)
+            mat = np.nan_to_num(mat, nan=0.0, posinf=1.0, neginf=0.0)
+            mn = float(np.min(mat))
+            mx = float(np.max(mat))
+            if mx - mn < 1e-8:
+                norm = np.zeros_like(mat, dtype=np.float32)
+            else:
+                norm = (mat - mn) / (mx - mn)
+            heat = np.clip(np.rint(norm * 255.0), 0, 255).astype(np.uint8)
+            rgb = np.stack([heat, np.clip((64 + heat // 2), 0, 255), (255 - heat)], axis=-1)
+            surf = self._pg.surfarray.make_surface(np.swapaxes(rgb, 0, 1))
+            surf = self._pg.transform.scale(surf, (cell_w, cell_h))
+            panel.blit(surf, (hx, hy))
+            self._draw_text(panel, f"H{idx} min={mn:.3f} max={mx:.3f}", hx, hy + cell_h + 3, small=True)
+
+    def _render_diagnostics_panel(self, diagnostics: dict[str, object]) -> object:
+        panel = self._pg.Surface((self._diag_panel_width, self._height))
+        panel.fill((18, 20, 24))
+        self._draw_text(panel, "Diagnostics (F1 toggle)", 14, 12)
+        tick = int(diagnostics.get("tick", -1))
+        mse = float(diagnostics.get("mse", 0.0))
+        self._draw_text(panel, f"tick={tick}  mse={mse:.6f}", 14, 36, small=True)
+
+        keys = np.asarray(diagnostics.get("keys", np.zeros(10, dtype=np.float32)), dtype=np.float32)
+        pressed = int(np.sum(keys > 0.1))
+        self._draw_text(panel, f"keys_pressed={pressed}", 14, 54, small=True)
+
+        control = np.asarray(diagnostics.get("control", np.zeros(6, dtype=np.float32)), dtype=np.float32)
+        self._draw_text(panel, "Control Decode", 14, 78)
+        self._draw_control_bars(panel, control, x=14, y=100, w=self._diag_panel_width - 24, h=120)
+
+        self._draw_text(panel, "Attention (last layer, live)", 14, 234)
+        attention = np.asarray(diagnostics.get("attention", np.zeros((0, 0, 0), dtype=np.float32)), dtype=np.float32)
+        grid_w = self._diag_panel_width - 30
+        cell_w = (grid_w - 8) // 2
+        cell_h = 120
+        self._draw_attention_grid(panel, attention, x=14, y=258, cell_w=cell_w, cell_h=cell_h)
+        return panel
+
+    def render_rgb_frame(self, frame: np.ndarray, diagnostics: dict[str, object] | None = None) -> None:
         if self.closed:
             return
+        diagnostics_active = self._show_diagnostics and (diagnostics is not None)
+        self._ensure_window_shape(diagnostics_active)
         # frame is HxWx3 RGB from VizDoom.
         surface = self._pg.image.frombuffer(frame.tobytes(), (frame.shape[1], frame.shape[0]), "RGB")
         if frame.shape[1] != self._width or frame.shape[0] != self._height:
             surface = self._pg.transform.scale(surface, (self._width, self._height))
         self._window.blit(surface, (0, 0))
+        if diagnostics_active and diagnostics is not None:
+            panel = self._render_diagnostics_panel(diagnostics)
+            self._window.blit(panel, (self._width, 0))
         self._pg.display.flip()
 
     def close(self) -> None:
@@ -799,6 +920,8 @@ class DoomTransformerLoop:
         self._mse_head_window = 256
         self._mse_head_sum = 0.0
         self._mse_head_count = 0
+        self._last_mse = 0.0
+        self._diagnostics_payload: dict[str, object] | None = None
         self._mse_tail_window = 256
         self._mse_tail_values: Deque[float] = deque(maxlen=self._mse_tail_window)
         self._world_sim_initialized = False
@@ -1622,7 +1745,7 @@ class DoomTransformerLoop:
         if state is None or state.screen_buffer is None:
             return
         frame = np.asarray(state.screen_buffer)
-        self.pygame_keyboard_sampler.render_rgb_frame(frame)
+        self.pygame_keyboard_sampler.render_rgb_frame(frame, diagnostics=self._diagnostics_payload)
 
     def _history_tensor(self) -> torch.Tensor:
         stacked = np.stack(list(self.history), axis=0)
@@ -3073,6 +3196,7 @@ class DoomTransformerLoop:
         if self.config.visible:
             if self.keyboard_source == "pygame_window":
                 print("Focus the 'Transformer Doom (focus this window)' game window for keyboard input.")
+                print("Press F1 to toggle diagnostics panel (live attention/control view).")
             else:
                 print("Click the game window once so key states are captured.")
             print("Controls: WASD + arrows for movement/turn, Space for attack, E for use.")
@@ -3198,7 +3322,7 @@ class DoomTransformerLoop:
                         enemy_target_logits,
                         low_level_logits,
                         memory_update_logits,
-                        _,
+                        attention_maps,
                     ) = self.model(inputs)
                 predicted = predicted_state.cpu().numpy()[0]
                 control = control_logits.cpu().numpy()[0]
@@ -3208,8 +3332,27 @@ class DoomTransformerLoop:
                 enemy_target = enemy_target_logits.cpu().numpy()[0]
                 low_level = low_level_logits.cpu().numpy()[0]
                 memory_update = memory_update_logits.cpu().numpy()[0]
+                attention_last = np.zeros((0, 0, 0), dtype=np.float32)
+                if len(attention_maps) > 0:
+                    try:
+                        attention_last = (
+                            attention_maps[-1]
+                            .detach()
+                            .cpu()
+                            .numpy()[0]
+                            .astype(np.float32, copy=False)
+                        )
+                    except Exception:
+                        attention_last = np.zeros((0, 0, 0), dtype=np.float32)
                 move_scale, turn_scale, fire_cd, enemy_low = self._apply_low_level_backend_controls(low_level)
                 keyboard_state = self._sanitize_keyboard_state(self._read_keyboard_state())
+                self._diagnostics_payload = {
+                    "tick": int(step),
+                    "mse": float(self._last_mse),
+                    "control": np.asarray(control, dtype=np.float32).copy(),
+                    "keys": np.asarray(keyboard_state, dtype=np.float32).copy(),
+                    "attention": attention_last,
+                }
                 enemy_count, enemy_cmd = self._apply_enemy_backend_commands(
                     enemy_behavior,
                     enemy_actuator,
@@ -3240,6 +3383,7 @@ class DoomTransformerLoop:
 
                 # This is the emulation signal (state-in -> predicted state-out).
                 mse = float(np.mean((predicted - observed_next) ** 2))
+                self._last_mse = mse
                 self._mse_total_sum += mse
                 self._mse_total_count += 1
                 if self._mse_head_count < self._mse_head_window:
