@@ -400,7 +400,6 @@ class HardcodedStateTransformer(nn.Module):
         context: int,
         enemy_slots: int = 16,
         enemy_cmd_dim: int = 1,
-        enemy_intent_dim: int = 1,
         enemy_actuator_dim: int = 21,
         low_level_dim: int | None = None,
         memory_update_dim: int = 1,
@@ -413,7 +412,6 @@ class HardcodedStateTransformer(nn.Module):
         super().__init__()
         self.enemy_slots = enemy_slots
         self.enemy_cmd_dim = enemy_cmd_dim
-        self.enemy_intent_dim = max(1, int(enemy_intent_dim))
         self.enemy_actuator_dim = max(1, int(enemy_actuator_dim))
         self.low_level_dim = low_level_dim if low_level_dim is not None else (4 + enemy_slots)
         self.memory_update_dim = max(1, int(memory_update_dim))
@@ -422,9 +420,7 @@ class HardcodedStateTransformer(nn.Module):
         self.state_out_proj = nn.Linear(d_model, state_dim)
         self.control_out_proj = nn.Linear(d_model, control_dim)
         self.enemy_out_proj = nn.Linear(d_model, enemy_slots * enemy_cmd_dim)
-        self.enemy_intent_out_proj = nn.Linear(d_model, enemy_slots * self.enemy_intent_dim)
         self.enemy_actuator_out_proj = nn.Linear(d_model, enemy_slots * self.enemy_actuator_dim)
-        self.intent_to_actuator_proj = nn.Linear(self.enemy_intent_dim, self.enemy_actuator_dim)
         self.low_level_out_proj = nn.Linear(d_model, self.low_level_dim)
         self.memory_out_proj = nn.Linear(d_model, enemy_slots * self.memory_update_dim)
         self.blocks = nn.ModuleList(
@@ -458,11 +454,7 @@ class HardcodedStateTransformer(nn.Module):
                     std = 0.06
                 elif "enemy_out_proj.weight" in name:
                     std = 0.03
-                elif "enemy_intent_out_proj.weight" in name:
-                    std = 0.03
                 elif "enemy_actuator_out_proj.weight" in name:
-                    std = 0.03
-                elif "intent_to_actuator_proj.weight" in name:
                     std = 0.03
                 elif "low_level_out_proj.weight" in name:
                     std = 0.02
@@ -497,7 +489,6 @@ class HardcodedStateTransformer(nn.Module):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        torch.Tensor,
         list[torch.Tensor],
     ]:
         # state_history: [batch, context, state_dim]
@@ -510,18 +501,13 @@ class HardcodedStateTransformer(nn.Module):
             attention_maps.append(attn)
         head = x[:, -1, :]
         enemy_logits = self.enemy_out_proj(head).view(-1, self.enemy_slots, self.enemy_cmd_dim)
-        enemy_intent_logits = self.enemy_intent_out_proj(head).view(-1, self.enemy_slots, self.enemy_intent_dim)
         enemy_actuator_logits = self.enemy_actuator_out_proj(head).view(-1, self.enemy_slots, self.enemy_actuator_dim)
-        intent_drive = torch.tanh(enemy_intent_logits)
-        intent_delta = self.intent_to_actuator_proj(intent_drive)
-        enemy_actuator_logits = enemy_actuator_logits + intent_delta
         low_level_logits = self.low_level_out_proj(head)
         memory_update_logits = self.memory_out_proj(head).view(-1, self.enemy_slots, self.memory_update_dim)
         return (
             self.state_out_proj(head),
             self.control_out_proj(head),
             enemy_logits,
-            enemy_intent_logits,
             enemy_actuator_logits,
             low_level_logits,
             memory_update_logits,
@@ -598,23 +584,16 @@ class DoomTransformerLoop:
             button for button in self.keyboard_buttons if button not in self.control_buttons
         ]
         self.control_dim = len(self.control_buttons)
-        # Minimal authoritative behavior head: direct target index scalar only.
-        self.enemy_behavior_core_channels = ("targetidx_norm",)
+        # Minimal authoritative behavior head: raw target actor-id command.
+        self.enemy_behavior_core_channels = ("target_actor_id_raw",)
         self.enemy_target_channels = ()
         self.enemy_behavior_channels = self.enemy_behavior_core_channels
         self.enemy_behavior_core_dim = len(self.enemy_behavior_core_channels)
         self.enemy_target_dim = 1 + self.config.enemy_slots  # player + slots
         self.enemy_target_mask_dim = 0
         self.enemy_cmd_dim = len(self.enemy_behavior_channels)
-        self.enemy_intent_channels = (
-            "intent_chase_logit",
-            "intent_flank_logit",
-            "intent_retreat_logit",
-            "intent_hold_logit",
-            "intent_timer_norm",
-        )
-        self.enemy_intent_dim = len(self.enemy_intent_channels)
-        self.enemy_intent_names = ("chase", "flank", "retreat", "hold")
+        self.enemy_intent_channels: tuple[str, ...] = ()
+        self.enemy_intent_dim = 0
         self.enemy_actuator_channels = (
             "act_speed_norm",
             "act_fwd_cmd",
@@ -626,21 +605,11 @@ class DoomTransformerLoop:
             "act_health_norm",
         )
         self.enemy_actuator_dim = len(self.enemy_actuator_channels)
-        self.enemy_base_feature_dim = 14
-        self.enemy_feedback_feature_dim = 4
-        self.enemy_memory_feature_dim = 10
-        self.enemy_memory_channels = (
-            "intent_chase_latent",
-            "intent_flank_latent",
-            "intent_retreat_latent",
-            "intent_hold_latent",
-            "identity_lock_strength",
-            "identity_write_gate",
-            "target_index_norm",
-            "target_keep_gate",
-            "target_identity_norm",
-            "slot_presence_norm",
-        )
+        self.enemy_base_feature_dim = 8
+        self.enemy_feedback_feature_dim = 0
+        self.enemy_memory_feature_dim = 4
+        self.enemy_memory_channels: tuple[str, ...] = ()
+        self.enemy_binding_dim = min(4, self.enemy_memory_feature_dim)
         self.enemy_memory_update_dim = 1 + self.enemy_memory_feature_dim
         self.enemy_feature_dim = (
             self.enemy_base_feature_dim + self.enemy_feedback_feature_dim + self.enemy_memory_feature_dim
@@ -678,7 +647,8 @@ class DoomTransformerLoop:
                 "fire_norm": 9.0,
                 "firecd_norm": 9.0,
                 "health_norm": 9.0,
-                "targetidx": -999.0,
+                "target_actor_id_raw": 9999.0,
+                "actor_id_raw": -9999.0,
                 "present_norm": 9.0,
                 "healthpct": -1,
             }
@@ -744,7 +714,6 @@ class DoomTransformerLoop:
             context=self.config.context,
             enemy_slots=self.config.enemy_slots,
             enemy_cmd_dim=self.enemy_cmd_dim,
-            enemy_intent_dim=self.enemy_intent_dim,
             enemy_actuator_dim=self.enemy_actuator_dim,
             low_level_dim=self.low_level_dim,
             memory_update_dim=self.enemy_memory_update_dim,
@@ -758,13 +727,11 @@ class DoomTransformerLoop:
         self._stale_key_ticks = 0
         self._attack_cooldown_left = 0
         self._control_logit_gain = self.config.nn_control_gain
-        self._enemy_logit_gain = self.config.nn_enemy_gain
         self._low_level_logit_gain = self.config.nn_low_level_gain
         self._runtime_move_scale = 1.0
         self._runtime_turn_scale = 1.0
         self._runtime_fire_cooldown_tics = self.config.fire_cooldown_tics
         self._runtime_fire_cooldown_float = float(self.config.fire_cooldown_tics)
-        self._enemy_fire_trigger_threshold = 0.10
         self._map_geometry: WADCollisionMap | None = None
         try:
             self._map_geometry = WADCollisionMap(self.config.wad_path, self.config.map_name)
@@ -1092,15 +1059,6 @@ class DoomTransformerLoop:
         except (TypeError, ValueError):
             return float(fallback)
 
-    def _enemy_observed_identity_norm(
-        self,
-        enemy: object,
-    ) -> float:
-        # Prefer raw runtime identifiers over crafted string hashing.
-        actor_id = self._enemy_attr_float(enemy, "id", 0.0)
-        actor_type = self._enemy_attr_float(enemy, "type", 0.0)
-        return float(np.clip((actor_id * 0.0005) + (actor_type * 0.0002), -1.0, 1.0))
-
     def _safe_game_variable(self, var_name: str, fallback: float = 0.0) -> float:
         try:
             variable = getattr(GameVariable, var_name)
@@ -1132,26 +1090,97 @@ class DoomTransformerLoop:
         self._last_enemy_cmds[slot]["fire_norm"] = 9.0
         self._last_enemy_cmds[slot]["firecd_norm"] = 9.0
         self._last_enemy_cmds[slot]["health_norm"] = 9.0
-        self._last_enemy_cmds[slot]["targetidx"] = -999.0
+        self._last_enemy_cmds[slot]["target_actor_id_raw"] = 9999.0
+        self._last_enemy_cmds[slot]["actor_id_raw"] = -9999.0
         self._last_enemy_cmds[slot]["present_norm"] = 9.0
         self._last_enemy_cmds[slot]["healthpct"] = -1
 
-    def _refresh_enemy_slot_assignments(self, state: object | None = None) -> list[object | None]:
-        # Canonicalize entity tokens by raw identity/state so slot order is not tied
-        # to transient observation ordering.
-        enemies = self._enemy_objects_from_state(state)
-        enemies.sort(
-            key=lambda enemy: (
-                int(self._enemy_attr_float(enemy, "id", 0.0)),
-                int(self._enemy_attr_float(enemy, "type", 0.0)),
-                float(self._enemy_attr_float(enemy, "position_x", 0.0)),
-                float(self._enemy_attr_float(enemy, "position_y", 0.0)),
-            )
+    def _enemy_observation_binding_token(self, enemy: object) -> np.ndarray:
+        # Raw-ish object token used by model-memory slot binding. No hand-tuned
+        # policy rules are applied here; this is a deterministic feature projection.
+        actor_id = self._enemy_attr_float(enemy, "id", 0.0)
+        actor_type = self._enemy_attr_float(enemy, "type", 0.0)
+        ex = self._enemy_attr_float(enemy, "position_x")
+        ey = self._enemy_attr_float(enemy, "position_y")
+        token = np.asarray(
+            [
+                np.tanh(actor_id / 32768.0),
+                np.tanh(actor_type / 1024.0),
+                np.tanh(ex / 4096.0),
+                np.tanh(ey / 4096.0),
+            ],
+            dtype=np.float32,
         )
+        return token
+
+    def _refresh_enemy_slot_assignments(self, state: object | None = None) -> list[object | None]:
+        enemies = self._enemy_objects_from_state(state)
         slot_enemies: list[object | None] = [None for _ in range(self.config.enemy_slots)]
-        count = min(len(enemies), self.config.enemy_slots)
-        for slot in range(count):
-            slot_enemies[slot] = enemies[slot]
+        if not enemies:
+            return slot_enemies
+
+        # If memory binding is unavailable, keep a deterministic canonical ordering
+        # (stable under frame reordering) instead of raw observation order.
+        if self.enemy_binding_dim <= 0:
+            ordered = sorted(
+                enemies,
+                key=lambda enemy: (
+                    self._enemy_attr_float(enemy, "id", 0.0),
+                    self._enemy_attr_float(enemy, "type", 0.0),
+                ),
+            )
+            for slot, enemy in enumerate(ordered[: self.config.enemy_slots]):
+                slot_enemies[slot] = enemy
+            return slot_enemies
+
+        obs_tokens = np.stack([self._enemy_observation_binding_token(enemy) for enemy in enemies], axis=0)
+        slot_keys = np.clip(self._enemy_memory[:, : self.enemy_binding_dim], -1.0, 1.0)
+        key_norms = np.linalg.norm(slot_keys, axis=1)
+
+        # Cold start: initialize slot-key memory from a deterministic canonical order.
+        if float(np.max(key_norms)) < 1e-5:
+            ordered_indices = sorted(
+                range(len(enemies)),
+                key=lambda idx: tuple(float(v) for v in obs_tokens[idx, : self.enemy_binding_dim]),
+            )
+            for slot, obs_idx in enumerate(ordered_indices[: self.config.enemy_slots]):
+                slot_enemies[slot] = enemies[obs_idx]
+                self._enemy_memory[slot, : self.enemy_binding_dim] = obs_tokens[obs_idx, : self.enemy_binding_dim]
+            return slot_enemies
+
+        used_obs: set[int] = set()
+        slot_order = np.argsort(-key_norms)
+        for slot in slot_order.tolist():
+            if slot < 0 or slot >= self.config.enemy_slots:
+                continue
+            key = slot_keys[slot, : self.enemy_binding_dim]
+            key_norm = float(np.linalg.norm(key))
+            if key_norm < 1e-6:
+                continue
+            best_obs = -1
+            best_score = -1e9
+            for obs_idx in range(len(enemies)):
+                if obs_idx in used_obs:
+                    continue
+                token = obs_tokens[obs_idx, : self.enemy_binding_dim]
+                token_norm = float(np.linalg.norm(token))
+                if token_norm < 1e-6:
+                    score = -1e6
+                else:
+                    score = float(np.dot(key, token) / (key_norm * token_norm + 1e-6))
+                if score > best_score:
+                    best_score = score
+                    best_obs = obs_idx
+            if best_obs >= 0:
+                slot_enemies[slot] = enemies[best_obs]
+                used_obs.add(best_obs)
+
+        # Fill any remaining unbound slots deterministically.
+        remaining_obs = [idx for idx in range(len(enemies)) if idx not in used_obs]
+        remaining_obs.sort(key=lambda idx: tuple(float(v) for v in obs_tokens[idx, : self.enemy_binding_dim]))
+        remaining_slots = [slot for slot, enemy in enumerate(slot_enemies) if enemy is None]
+        for slot, obs_idx in zip(remaining_slots, remaining_obs):
+            slot_enemies[slot] = enemies[obs_idx]
         return slot_enemies
 
     def _enemy_feature_block(self, state: object | None) -> tuple[np.ndarray, np.ndarray]:
@@ -1167,54 +1196,32 @@ class DoomTransformerLoop:
                 continue
 
             actor_id = self._enemy_attr_float(enemy, "id", 0.0)
-            actor_type = self._enemy_attr_float(enemy, "type", 0.0)
             ex = self._enemy_attr_float(enemy, "position_x")
             ey = self._enemy_attr_float(enemy, "position_y")
             ez = self._enemy_attr_float(enemy, "position_z")
             vx = self._enemy_attr_float(enemy, "velocity_x")
             vy = self._enemy_attr_float(enemy, "velocity_y")
             vz = self._enemy_attr_float(enemy, "velocity_z")
-            angle = self._normalize_angle_deg(self._enemy_attr_float(enemy, "angle"))
-            pitch = self._normalize_angle_deg(self._enemy_attr_float(enemy, "pitch"))
-            radius = self._enemy_attr_float(enemy, "radius", 20.0)
-            height = self._enemy_attr_float(enemy, "height", 56.0)
             health_obs = self._enemy_attr_float(enemy, "health", 0.0)
-            prev_health_obs = float(self._enemy_prev_health_obs[slot])
-            self._enemy_prev_health_obs[slot] = health_obs
-            obs_identity = self._enemy_observed_identity_norm(enemy)
+            obs_identity = actor_id
             self._enemy_slot_obs_identity[slot] = obs_identity
             self._enemy_slot_obs_present[slot] = 1.0
 
             # Per-slot feature layout:
-            # Base (14): raw object state.
-            # Feedback (4): previous raw observations.
-            # Memory (10): persistent latent updated only by Transformer memory-update head.
-            block[base + 0] = 100.0 if enemy is not None else 0.0
-            block[base + 1] = actor_id
-            block[base + 2] = actor_type
-            block[base + 3] = ex
-            block[base + 4] = ey
-            block[base + 5] = ez
-            block[base + 6] = vx
-            block[base + 7] = vy
-            block[base + 8] = vz
-            block[base + 9] = angle
-            block[base + 10] = pitch
-            block[base + 11] = health_obs
-            block[base + 12] = radius
-            block[base + 13] = height
-
-            prev_x = float(self._enemy_prev_x[slot])
-            prev_y = float(self._enemy_prev_y[slot])
-            prev_present = 100.0 if (np.isfinite(prev_x) and np.isfinite(prev_y)) else 0.0
+            # Base (8): reduced raw object state token.
+            # Feedback (0): disabled to reduce handcrafted temporal proxies.
+            # Memory (4): model-owned slot binding memory for permutation stability.
+            block[base + 0] = actor_id
+            block[base + 1] = ex
+            block[base + 2] = ey
+            block[base + 3] = ez
+            block[base + 4] = vx
+            block[base + 5] = vy
+            block[base + 6] = vz
+            block[base + 7] = health_obs
 
             fb = base + self.enemy_base_feature_dim
-            # Feedback: previous raw observations.
-            block[fb + 0] = prev_x if np.isfinite(prev_x) else 0.0
-            block[fb + 1] = prev_y if np.isfinite(prev_y) else 0.0
-            block[fb + 2] = prev_health_obs if np.isfinite(prev_health_obs) else 0.0
-            block[fb + 3] = prev_present
-
+            # Feedback channels removed; memory follows base channels directly.
             mb = fb + self.enemy_feedback_feature_dim
             # Memory latent channels (updated only by Transformer memory-update head).
             memory = np.clip(self._enemy_memory[slot], -1.0, 1.0)
@@ -1222,7 +1229,8 @@ class DoomTransformerLoop:
 
             self._enemy_prev_x[slot] = ex
             self._enemy_prev_y[slot] = ey
-            self._enemy_prev_angle[slot] = angle
+            self._enemy_prev_angle[slot] = self._enemy_attr_float(enemy, "angle")
+            self._enemy_prev_health_obs[slot] = health_obs
 
         return block, target_mask
 
@@ -1476,12 +1484,11 @@ class DoomTransformerLoop:
             else:
                 slot_actuator = slot_actuator[: self.enemy_actuator_dim]
             actuator_drive = np.nan_to_num(
-                slot_actuator * self._enemy_logit_gain,
+                slot_actuator,
                 nan=0.0,
-                posinf=4.0,
-                neginf=-4.0,
+                posinf=0.0,
+                neginf=0.0,
             )
-            actuator_drive = np.clip(actuator_drive, -1.0, 1.0)
 
             slot_behavior = np.asarray(enemy_behavior[slot], dtype=np.float32).reshape(-1)
             if slot_behavior.size < self.enemy_cmd_dim:
@@ -1490,44 +1497,39 @@ class DoomTransformerLoop:
                 slot_behavior = padded_slot_behavior
             else:
                 slot_behavior = slot_behavior[: self.enemy_cmd_dim]
-            targetidx_norm = float(np.tanh(float(slot_behavior[0]) * self._enemy_logit_gain))
-            selected_index = int(
-                np.clip(
-                    np.rint((0.5 + 0.5 * targetidx_norm) * float(self.config.enemy_slots)),
-                    0,
-                    self.config.enemy_slots,
+            target_actor_id_raw = float(
+                np.nan_to_num(
+                    float(slot_behavior[0]),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
                 )
             )
 
-            speed_norm = float(np.clip(1.0 + actuator_drive[0], 0.0, 3.0))
+            speed_norm = float(actuator_drive[0])
             fwd_norm = float(actuator_drive[1])
             side_norm = float(actuator_drive[2])
             turn_norm = float(actuator_drive[3])
-            aim_norm = float(np.clip(0.5 + 0.5 * actuator_drive[4], 0.0, 1.0))
-            fire_norm = float(np.clip(0.5 + 0.5 * actuator_drive[5], 0.0, 1.0))
-            firecd_norm = float(np.clip(0.5 + 0.5 * actuator_drive[6], 0.0, 1.0))
-            health_norm = float(np.clip(0.5 + 0.5 * actuator_drive[7], 0.0, 1.0))
+            aim_norm = float(actuator_drive[4])
+            fire_norm = float(actuator_drive[5])
+            firecd_norm = float(actuator_drive[6])
+            health_norm = float(actuator_drive[7])
 
             if enemy is not None:
-                obs_identity = float(self._enemy_slot_obs_identity[slot])
-                prev_obs_identity = float(self._enemy_prev_obs_identity[slot])
-                if np.isfinite(prev_obs_identity):
-                    self._enemy_metric_identity_samples += 1
-                    if abs(obs_identity - prev_obs_identity) > 0.35:
-                        self._enemy_metric_identity_churn += 1
-                self._enemy_prev_obs_identity[slot] = obs_identity
-                last_target = int(self._enemy_last_target_index[slot])
-                if last_target >= 0 and selected_index != last_target:
-                    target_switches_tick += 1
-                self._enemy_last_target_index[slot] = selected_index
+                self._enemy_prev_obs_identity[slot] = np.nan
+                self._enemy_last_target_index[slot] = -1
                 present_norm = 1.0
-                # Keep metric decode aligned with the mod's stateless trigger gate.
-                if (fire_norm * firecd_norm * aim_norm) > self._enemy_fire_trigger_threshold:
-                    shots_tick += 1.0 / float(max(1, active_enemy_count))
+                actor_id_raw = self._enemy_attr_float(enemy, "id", -1.0)
+                # Continuous shot-pressure metric proxy.
+                shots_tick += (
+                    float(np.clip(max(0.0, fire_norm), 0.0, 1.0))
+                    / float(max(1, active_enemy_count))
+                )
             else:
                 present_norm = -1.0
                 self._enemy_prev_obs_identity[slot] = np.nan
                 self._enemy_last_target_index[slot] = -1
+                actor_id_raw = -1.0
                 speed_norm = 0.0
                 fwd_norm = 0.0
                 side_norm = 0.0
@@ -1536,28 +1538,36 @@ class DoomTransformerLoop:
                 fire_norm = 0.0
                 firecd_norm = 0.0
                 health_norm = 0.0
-                selected_index = 0
+                target_actor_id_raw = -1.0
 
-            self._send_enemy_float_command(slot, "speed_norm", speed_norm, "speed_norm", 0.0, 3.0)
-            self._send_enemy_float_command(slot, "fwd_norm", fwd_norm, "fwd_norm", -1.0, 1.0)
-            self._send_enemy_float_command(slot, "side_norm", side_norm, "side_norm", -1.0, 1.0)
-            self._send_enemy_float_command(slot, "turn_norm", turn_norm, "turn_norm", -1.0, 1.0)
-            self._send_enemy_float_command(slot, "aim_norm", aim_norm, "aim_norm", 0.0, 1.0)
-            self._send_enemy_float_command(slot, "fire_norm", fire_norm, "fire_norm", 0.0, 1.0)
-            self._send_enemy_float_command(slot, "firecd_norm", firecd_norm, "firecd_norm", 0.0, 1.0)
-            self._send_enemy_float_command(slot, "health_norm", health_norm, "health_norm", 0.0, 1.0)
-            self._send_enemy_int_command(
+            self._send_enemy_float_command(slot, "speed_norm", speed_norm, "speed_norm", -32.0, 32.0)
+            self._send_enemy_float_command(slot, "fwd_norm", fwd_norm, "fwd_norm", -64.0, 64.0)
+            self._send_enemy_float_command(slot, "side_norm", side_norm, "side_norm", -64.0, 64.0)
+            self._send_enemy_float_command(slot, "turn_norm", turn_norm, "turn_norm", -180.0, 180.0)
+            self._send_enemy_float_command(slot, "aim_norm", aim_norm, "aim_norm", -180.0, 180.0)
+            self._send_enemy_float_command(slot, "fire_norm", fire_norm, "fire_norm", -64.0, 64.0)
+            self._send_enemy_float_command(slot, "firecd_norm", firecd_norm, "firecd_norm", -64.0, 64.0)
+            self._send_enemy_float_command(slot, "health_norm", health_norm, "health_norm", -256.0, 256.0)
+            self._send_enemy_float_command(
                 slot,
-                "targetidx",
-                selected_index,
-                "targetidx",
-                0,
-                self.enemy_target_dim - 1,
+                "target_actor_id_raw",
+                target_actor_id_raw,
+                "target_actor_id_raw",
+                -32768.0,
+                32768.0,
+            )
+            self._send_enemy_float_command(
+                slot,
+                "actor_id_raw",
+                actor_id_raw,
+                "actor_id_raw",
+                -1.0,
+                1000000000.0,
             )
             self._send_enemy_float_command(slot, "present_norm", present_norm, "present_norm", -1.0, 1.0)
 
             # Retain this scalar for diagnostics/legacy low-level logs.
-            healthpct = int(np.clip(np.rint(20.0 + 280.0 * health_norm), 0, 300))
+            healthpct = int(np.clip(np.rint(health_norm), 0, 300))
             self._last_enemy_cmds[slot]["healthpct"] = float(healthpct)
 
             self._update_enemy_memory_state(
@@ -1747,7 +1757,7 @@ class DoomTransformerLoop:
                 if self._world_enemies[slot, 4] <= 0.5:
                     continue
                 _speed, _fwd, _side, _turn, aim_norm, fire_norm = enemy_commands[slot]
-                if (aim_norm * fire_norm) <= self._enemy_fire_trigger_threshold:
+                if aim_norm <= 0.0 or fire_norm <= 0.0:
                     continue
                 ex = float(self._world_enemies[slot, 0])
                 ey = float(self._world_enemies[slot, 1])
@@ -2157,22 +2167,22 @@ class DoomTransformerLoop:
             "NN gains: "
             f"weight_scale={self.config.nn_weight_scale:.2f} "
             f"control_gain={self.config.nn_control_gain:.2f} "
-            f"enemy_gain={self.config.nn_enemy_gain:.2f} "
             f"low_level_gain={self.config.nn_low_level_gain:.2f}"
         )
+        if abs(self.config.nn_enemy_gain - 1.0) > 1e-6:
+            print(
+                "Note: nn_enemy_gain is compatibility-only and no longer used in "
+                "enemy backend decode."
+            )
         print(
             f"Enemy state features: slots={self.config.enemy_slots} per_slot={self.enemy_feature_dim} "
             f"(base={self.enemy_base_feature_dim}+feedback={self.enemy_feedback_feature_dim}+memory={self.enemy_memory_feature_dim}) "
             f"total={self.enemy_feature_dim_total} + target_mask={self.enemy_target_mask_dim} "
-            "(canonicalized token order by raw identity/state + model-owned lifecycle/permutation memory)"
+            "(model-memory slot binding; actor-id-routed execution in mod)"
         )
         print(
             f"Enemy behavior head (target decode): channels={self.enemy_cmd_dim} "
             f"{'/'.join(self.enemy_behavior_channels)}"
-        )
-        print(
-            f"Enemy intent head (actuation blend): channels={self.enemy_intent_dim} "
-            f"{'/'.join(self.enemy_intent_channels)}"
         )
         print(
             f"Enemy actuator head: channels={self.enemy_actuator_dim} "
@@ -2183,19 +2193,14 @@ class DoomTransformerLoop:
             f"(gate + {self.enemy_memory_feature_dim}-dim delta per slot)"
         )
         print(
-            "Enemy intent head source: model context => "
-            f"{'/'.join(self.enemy_intent_names)} + intent_timer_norm (projected in-model to actuator deltas)"
+            "Enemy target source: direct model actor-id target command (range-safe transport only)"
         )
         print(
-            "Enemy target source: direct model targetidx_norm scalar (behavior head) "
-            "decoded to targetidx with range clamp only"
+            "Enemy fire timing source: deterministic continuous fire decode "
+            "(model fire_norm + firecd_norm, no mod-side cooldown/integrator state)."
         )
         print(
-            "Enemy fire timing source: direct actuator firecd command "
-            "(float decode + safety clamp only)"
-        )
-        print(
-            "Enemy fire pulse source: direct actuator fire command (stateless mod decode)"
+            "Enemy fire pulse source: direct actuator fire command (no RNG policy glue)."
         )
         print(
             "Enemy fire source: direct actuator channel projection (no Python policy shaping)"
@@ -2236,7 +2241,6 @@ class DoomTransformerLoop:
                         predicted_state,
                         control_logits,
                         enemy_behavior_logits,
-                        enemy_intent_logits,
                         enemy_actuator_logits,
                         low_level_logits,
                         memory_update_logits,
@@ -2245,7 +2249,6 @@ class DoomTransformerLoop:
                 predicted = predicted_state.cpu().numpy()[0]
                 control = control_logits.cpu().numpy()[0]
                 enemy_behavior = enemy_behavior_logits.cpu().numpy()[0]
-                _ = enemy_intent_logits
                 enemy_actuator = enemy_actuator_logits.cpu().numpy()[0]
                 low_level = low_level_logits.cpu().numpy()[0]
                 memory_update = memory_update_logits.cpu().numpy()[0]
@@ -2508,7 +2511,7 @@ def parse_args() -> EmulationConfig:
         "--nn-enemy-gain",
         type=float,
         default=0.62,
-        help="Enemy head logit gain before tanh decoding.",
+        help="Compatibility-only knob (enemy decode path no longer applies this gain).",
     )
     parser.add_argument(
         "--nn-low-level-gain",

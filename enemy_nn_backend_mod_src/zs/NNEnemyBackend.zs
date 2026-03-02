@@ -1,27 +1,8 @@
 class NNEnemyBackendHandler : EventHandler
 {
     static const int MAX_SLOTS = 16;
-    static const double FIRE_TRIGGER_THRESHOLD = 0.10;
     Actor slotActors[MAX_SLOTS];
     int slotCount;
-
-    private Actor FindAnyPlayer()
-    {
-        ThinkerIterator pit = ThinkerIterator.Create("PlayerPawn");
-        Actor pawn = Actor(pit.Next());
-        return pawn;
-    }
-
-    private int ReadSlotInt(int slot, String suffix, int fallback)
-    {
-        String cvarName = String.Format("nn_enemy_cmd_%02d_%s", slot, suffix);
-        CVar v = CVar.FindCVar(cvarName);
-        if (v == null)
-        {
-            return fallback;
-        }
-        return v.GetInt();
-    }
 
     private double ReadSlotFloat(int slot, String suffix, double fallback)
     {
@@ -54,87 +35,90 @@ class NNEnemyBackendHandler : EventHandler
         return limit;
     }
 
-    private Actor DecodeTargetActor(int selfSlot, Actor player, int targetIndex)
+    private int DecodeActorCommandId(int commandSlot)
     {
-        bool playerValid = (player != null && player.health > 0);
-        int totalTargets = 1 + slotCount;
-        if (totalTargets < 1)
-        {
-            return playerValid ? player : null;
-        }
-        if (targetIndex < 0) targetIndex = 0;
-        if (targetIndex > totalTargets - 1) targetIndex = totalTargets - 1;
-
-        if (targetIndex == 0)
-        {
-            return playerValid ? player : null;
-        }
-
-        int targetSlot = targetIndex - 1;
-        if (targetSlot == selfSlot)
-        {
-            return playerValid ? player : null;
-        }
-        if (targetSlot >= 0 && targetSlot < slotCount)
-        {
-            Actor target = slotActors[targetSlot];
-            if (target != null && target.health > 0)
-            {
-                return target;
-            }
-        }
-        return playerValid ? player : null;
+        return int(ReadSlotFloat(commandSlot, "actor_id_raw", -1.0));
     }
 
-    private void ApplyEnemySlotCommand(Actor mo, int slot, Actor player)
+    private int FindCommandSlotForActor(int actorId, int slotLimit)
     {
-        double presentNorm = Clamp(ReadSlotFloat(slot, "present_norm", 1.0), -1.0, 1.0);
-        double speedNorm = Clamp(ReadSlotFloat(slot, "speed_norm", 0.0), 0.0, 3.0);
-        double fwdNorm = Clamp(ReadSlotFloat(slot, "fwd_norm", 0.0), -1.0, 1.0);
-        double sideNorm = Clamp(ReadSlotFloat(slot, "side_norm", 0.0), -1.0, 1.0);
-        double turnNorm = Clamp(ReadSlotFloat(slot, "turn_norm", 0.0), -1.0, 1.0);
-        double aimNorm = Clamp(ReadSlotFloat(slot, "aim_norm", 0.0), 0.0, 1.0);
-        double fireNorm = Clamp(ReadSlotFloat(slot, "fire_norm", 0.0), 0.0, 1.0);
-        double fireCdNorm = Clamp(ReadSlotFloat(slot, "firecd_norm", 0.0), 0.0, 1.0);
-        double healthNorm = Clamp(ReadSlotFloat(slot, "health_norm", 1.0), 0.0, 1.0);
-        int targetIndex = ReadSlotInt(slot, "targetidx", 0);
-
-        if (presentNorm < -0.5)
+        for (int commandSlot = 0; commandSlot < slotLimit; commandSlot++)
         {
-            mo.target = null;
-            mo.Vel.X = 0.0;
-            mo.Vel.Y = 0.0;
-            return;
+            int commandActorId = DecodeActorCommandId(commandSlot);
+            if (commandActorId == actorId)
+            {
+                return commandSlot;
+            }
         }
+        return -1;
+    }
 
-        int targetHealth = int(double(mo.Default.health) * healthNorm);
-        if (targetHealth < 1)
+    private Actor DecodeTargetActor(int commandSlot)
+    {
+        int targetActorId = int(ReadSlotFloat(commandSlot, "target_actor_id_raw", -1.0));
+        if (targetActorId < 0)
         {
-            targetHealth = 1;
+            return null;
         }
-        mo.health = targetHealth;
-        mo.Speed = mo.Default.Speed * speedNorm;
+        ThinkerIterator it = ThinkerIterator.Create("Actor");
+        Actor target;
+        while ((target = Actor(it.Next())) != null)
+        {
+            if (int(target.id) != targetActorId)
+            {
+                continue;
+            }
+            return target;
+        }
+        return null;
+    }
+
+    private void ApplyEnemyCommand(Actor mo, int commandSlot)
+    {
+        // Hard safety bounds only (raw model command semantics).
+        double speedCmd = Clamp(ReadSlotFloat(commandSlot, "speed_norm", 0.0), -64.0, 64.0);
+        double fwdCmd = Clamp(ReadSlotFloat(commandSlot, "fwd_norm", 0.0), -256.0, 256.0);
+        double sideCmd = Clamp(ReadSlotFloat(commandSlot, "side_norm", 0.0), -256.0, 256.0);
+        double turnCmd = Clamp(ReadSlotFloat(commandSlot, "turn_norm", 0.0), -720.0, 720.0);
+        double aimCmd = Clamp(ReadSlotFloat(commandSlot, "aim_norm", 0.0), -720.0, 720.0);
+        double fireCmd = Clamp(ReadSlotFloat(commandSlot, "fire_norm", 0.0), -256.0, 256.0);
+        double fireCdCmd = Clamp(ReadSlotFloat(commandSlot, "firecd_norm", 0.0), -256.0, 256.0);
+        double healthCmd = Clamp(ReadSlotFloat(commandSlot, "health_norm", 0.0), -512.0, 512.0);
+
         mo.threshold = 0;
+        mo.Angle += turnCmd + aimCmd;
 
-        mo.Angle += 120.0 * turnNorm;
-        Actor targetActor = DecodeTargetActor(slot, player, targetIndex);
+        Actor targetActor = DecodeTargetActor(commandSlot);
         mo.target = targetActor;
-        if (targetActor != null)
-        {
-            mo.A_FaceTarget();
-        }
 
         double yaw = mo.Angle;
         double c = Cos(yaw);
         double s = Sin(yaw);
-        double scale = mo.Speed * 0.45;
-        mo.Vel.X = (c * fwdNorm - s * sideNorm) * scale;
-        mo.Vel.Y = (s * fwdNorm + c * sideNorm) * scale;
+        double moveX = c * fwdCmd - s * sideCmd;
+        double moveY = s * fwdCmd + c * sideCmd;
+        mo.Vel.X = Clamp(moveX * speedCmd, -1024.0, 1024.0);
+        mo.Vel.Y = Clamp(moveY * speedCmd, -1024.0, 1024.0);
 
-        // Stateless decode: model emits trigger each tick.
-        if (targetActor != null && (fireNorm * fireCdNorm * aimNorm) > FIRE_TRIGGER_THRESHOLD)
+        // Fire timing semantics are now direct from model outputs with no per-slot
+        // mod-side cooldown/integrator memory.
+        double cadence = Clamp(Abs(fireCdCmd), 1.0, 256.0);
+        double drive = Clamp(fireCmd, 0.0, cadence);
+        if (drive > 0.0)
         {
-            mo.SetStateLabel("Missile");
+            int tickSeed = level.time + int(mo.id);
+            double phase = double(tickSeed) - cadence * Floor(double(tickSeed) / cadence);
+            if (phase < drive)
+            {
+                mo.SetStateLabel("Missile");
+            }
+        }
+
+        // Raw additive health command (bounded only for crash safety).
+        if (healthCmd != 0.0)
+        {
+            double maxHealth = double(mo.Default.health) * 4.0;
+            if (maxHealth < 1.0) maxHealth = 1.0;
+            mo.health = int(Clamp(double(mo.health) + healthCmd, 1.0, maxHealth));
         }
     }
 
@@ -147,7 +131,6 @@ class NNEnemyBackendHandler : EventHandler
         }
 
         int slotLimit = ReadSlotLimit();
-        Actor player = FindAnyPlayer();
         ThinkerIterator it = ThinkerIterator.Create("Actor");
         Actor mo;
         slotCount = 0;
@@ -170,6 +153,7 @@ class NNEnemyBackendHandler : EventHandler
             slotActors[i] = null;
         }
 
+        // Actor-ID keyed routing: command ownership is independent of runtime slot ordering.
         for (int slot = 0; slot < slotCount; slot++)
         {
             Actor slotActor = slotActors[slot];
@@ -177,7 +161,13 @@ class NNEnemyBackendHandler : EventHandler
             {
                 continue;
             }
-            ApplyEnemySlotCommand(slotActor, slot, player);
+            int actorId = int(slotActor.id);
+            int commandSlot = FindCommandSlotForActor(actorId, slotLimit);
+            if (commandSlot < 0)
+            {
+                continue;
+            }
+            ApplyEnemyCommand(slotActor, commandSlot);
         }
     }
 }

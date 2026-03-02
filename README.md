@@ -79,27 +79,25 @@ python3 run_enemy_regression.py --wad DOOM.WAD --enemy-backend-mod enemy_nn_back
 - The Transformer runs every tick on a temporal state window (`context=32`) and outputs:
   - `state_out` (predicted next backend state vector).
   - `control_logits` (decoded into Doom control actions).
-  - `enemy_logits` (per-slot behavior head; authoritative `targetidx_norm` scalar per slot).
-  - `enemy_intent_logits` (per-slot intent head used to modulate final actuation decode).
+  - `enemy_logits` (per-slot behavior head; authoritative direct `target_actor_id_raw` command).
   - `enemy_actuator_logits` (per-slot final actuator commands: `speed/fwd/side/turn/aim/fire/firecd/health`).
   - `low_level_logits` (non-standard backend knobs for player dynamics).
   - `memory_update_logits` (per-slot memory update channels: gate + delta for persistent enemy latent state).
 - The player action sent to Doom is computed from Transformer logits each tick (keyboard-gated, NN-modulated strength/conflict resolution).
 - In `--enemy-backend-transformer` mode, the loop also sends per-slot enemy commands to a custom mod (`enemy_nn_backend_mod.pk3`) each tick:
   - Transformer behavior channels are decoded into backend actuation:
-    - behavior channels: minimal authoritative `targetidx_norm` scalar (per slot).
-    - per-slot target selection is decoded directly from `targetidx_norm` with index-range safety clamp only.
+    - behavior channels: minimal authoritative direct `target_actor_id_raw` command (per slot).
+    - per-slot target selection is decoded as direct actor-id command with range safety clamp only.
     - final backend actuation is fully direct from final actuator channels with hard safety bounds only
-    - actuation channels sent to Doom/mod are normalized float cvars: `speed_norm`, `fwd_norm`, `side_norm`, `turn_norm`, `aim_norm`, `fire_norm`, `firecd_norm`, `health_norm`, `present_norm` plus direct target index cvar `targetidx`
+    - actuation channels sent to Doom/mod are normalized float cvars: `speed_norm`, `fwd_norm`, `side_norm`, `turn_norm`, `aim_norm`, `fire_norm`, `firecd_norm`, `health_norm`, `present_norm`, plus direct actor-id cvars `actor_id_raw` and `target_actor_id_raw`
   - aiming/firing/timing are decoded directly from actuator channels (`act_aim_norm`, `act_fire_norm`, `act_firecd_norm`) and passed to the mod as normalized floats.
-  - mod-side fire timing now uses direct stateless model trigger decode (`fire_norm`, `firecd_norm`) without a rule-based cooldown counter/integrator.
+  - mod-side fire timing uses deterministic continuous decode (`fire_norm` drive + `firecd_norm` cadence) from model outputs with no per-slot cooldown counter/integrator state.
   - mod-side aim uses direct stateless trigger decode (`aim_norm`) without quantized pulse counters.
-  - target policy execution in the mod uses direct model-decoded target index (`targetidx`) with no scalar remap path.
+  - target policy execution in the mod resolves direct model-decoded actor ids (`target_actor_id_raw`) to live actors.
   - enemy health control is driven directly from `act_health_norm` (normalized float path).
-  - enemy intent head (`chase/flank/retreat/hold` + timer) is projected in-model into actuator deltas (no Python heuristic intent-mixing).
-- Per-enemy memory state is maintained in-loop as a persistent latent (`10` values/slot), updated each tick only by Transformer memory-update outputs (gate + delta), and fed back into `state_in`.
-  - explicit memory channels include `target_identity_norm` and `slot_presence_norm`; memory evolution is Transformer-only (gate + delta), with no Python-side memory writeback rules.
-  - Python slot assignment canonicalizes observed enemies by raw identity/state keys (`id/type/x/y`) to remove frame-order drift; lifecycle/continuity stays in model memory channels.
+- Per-enemy memory latent channels are enabled (`memory_dim=4`) and updated by Transformer memory outputs (gate + 4-delta).
+  - Slot identity persistence is reorder-robust via model-memory slot binding, instead of raw observation order.
+  - Command ownership at execution remains actor-id keyed in the mod.
 - By default, Doom remains authoritative for rendering and core simulation (physics, collisions, damage, doors/triggers, pickups, map logic).
 - With `--nn-world-sim` (experimental), low-level movement/collision/combat are stepped in Transformer-side Python state and bridged back into Doom each tick (`warp`/`setangle` + enemy health sync).
 
@@ -114,23 +112,22 @@ python3 run_enemy_regression.py --wad DOOM.WAD --enemy-backend-mod enemy_nn_back
 - Output heads:
   - `state_out_proj`: `Linear(256 -> state_dim)`.
   - `control_out_proj`: `Linear(256 -> 6)`.
-  - `enemy_out_proj`: `Linear(256 -> enemy_slots * enemy_cmd_dim)` (default `16 * 1`; per-slot `targetidx_norm`).
-  - `enemy_intent_out_proj`: `Linear(256 -> enemy_slots * enemy_intent_dim)` (default `16 * 5`; 4 intent logits + 1 timer signal per slot).
+  - `enemy_out_proj`: `Linear(256 -> enemy_slots * enemy_cmd_dim)` (default `16 * 1`; per-slot direct `target_actor_id_raw`).
   - `enemy_actuator_out_proj`: `Linear(256 -> enemy_slots * enemy_actuator_dim)` (default `16 * 8`; per-slot `speed/fwd/side/turn/aim/fire/firecd/health`).
   - `low_level_out_proj`: `Linear(256 -> low_level_dim)` where `low_level_dim = 4 + enemy_slots * 1` (default `20`).
-  - `memory_out_proj`: `Linear(256 -> enemy_slots * memory_update_dim)` where `memory_update_dim = 1 + memory_dim` (default `11` = gate + 10-delta).
+  - `memory_out_proj`: `Linear(256 -> enemy_slots * memory_update_dim)` where `memory_update_dim = 1 + memory_dim` (default `5` = gate + 4-delta).
 - Context length: `32`.
 - Training: none. Weights are deterministic hardcoded at startup and frozen (`requires_grad=False`).
 
 ### 3. Number of parameters
 
 - Default runtime (`1024x768`, `frame_pool=16`):
-  - `state_dim = 3662`.
-  - Total parameters: `4,096,808`.
+  - `state_dim = 3406`.
+  - Total parameters: `3,920,200`.
   - Trainable parameters: `0`.
 - At `1280x960` with `frame_pool=16`:
-  - `state_dim = 5390`.
-  - Total parameters: `4,983,272`.
+  - `state_dim = 5134`.
+  - Total parameters: `4,806,664`.
 
 ### 4. Input features
 
@@ -142,12 +139,10 @@ Per tick, one `state_in` vector is built and then stacked over time (`context=32
   - For `1280x960` with `frame_pool=16`: `4800` values (`80 x 60`).
 - Keyboard features: `10` values:
   - forward, backward, strafe-left, strafe-right, turn-left, turn-right, look-up, look-down, attack, use.
-- Enemy slot features: `enemy_slots * 28` values (default `16 * 28 = 448`), in canonicalized raw-identity order (`id/type/x/y` sort):
-  - Base features (`14`/slot): raw object state (`presence`, `id`, `type`, `x/y/z`, `vx/vy/vz`, `angle`, `pitch`, `health`, `radius`, `height`).
-  - Feedback features (`4`/slot): previous raw observations (`prev_x`, `prev_y`, `prev_health`, previous-observation flag).
-- Memory features (`10`/slot): persistent NN-updated latent channels (gate + delta), carried across ticks and fed back into `state_in`.
-  - includes explicit `target_identity_norm` and `slot_presence_norm` channels for slot identity continuity.
-- Target-valid mask features: none (direct `targetidx_norm` decode path).
+- Enemy slot features: `enemy_slots * 12` values (default `16 * 12 = 192`):
+  - Base features (`8`/slot): reduced raw object state (`id`, `x/y/z`, `vx/vy/vz`, `health`).
+- Memory features: `4`/slot model-owned slot-binding latent channels.
+- Target-valid mask features: none (direct `target_actor_id_raw` decode path).
 
 ### 5. Input feature description
 
@@ -187,19 +182,17 @@ Per tick, one `state_in` vector is built and then stacked over time (`context=32
 - The Transformer predicts both:
   - `state_out` (next state vector)
   - control logits (decoded to Doom buttons)
-  - enemy logits (behavior head; authoritative `targetidx_norm`)
-  - enemy intent logits (used in final enemy actuation blend)
+  - enemy logits (behavior head; authoritative `target_actor_id_raw`)
   - enemy actuator logits (decoded per slot: final movement/turn/aim/fire/firecd/health)
   - low-level logits (decoded to non-standard player dynamics)
 - Player control is keyboard-gated but now NN-modulated each tick: control logits scale movement/turn strength, and still resolve opposing-key conflicts.
 - Experimental enemy-backend mode:
   - Build mod with `python3 build_enemy_nn_mod.py`.
   - Enable with `--enemy-backend-transformer --enemy-backend-mod enemy_nn_backend_mod.pk3`.
-  - Current implementation applies per-slot monster movement/pathing/aiming/firing commands from Transformer outputs, with canonicalized slot feed, direct actuator decode, and normalized float command transfer into the backend mod.
+  - Current implementation applies per-slot monster movement/pathing/aiming/firing commands from Transformer outputs, with model-memory slot binding (reorder-robust), direct actuator decode, and normalized float command transfer into the backend mod.
   - Python-side decode shaping is reduced to crash-safe bounds + command transport only (no Python target keep/blend logic and no Python fire-policy gating).
-  - Mod-side decode is stateless (no rule-based per-slot cooldown/integrator state and no quantized pulse counters).
-  - Target selection is decoded from model `targetidx_norm` into `targetidx`, then resolved to actual actors in the mod.
-  - Intent logits (`chase/flank/retreat/hold` + timer) are projected in-model into final actuator channels.
+  - Mod-side decode uses deterministic continuous fire timing directly from model channels (`fire_norm`, `firecd_norm`) and no RNG gating.
+  - Target selection is decoded from model direct `target_actor_id_raw` and resolved to actual actors by actor id in the mod.
   - Headless runs print regression metrics summary (`shots_per_tick`, `target_switches`, `close_pairs_per_tick`, `identity_churn_rate`, `player_max_stuck_ticks`, `mse_mean`, `mse_drift`) at session end.
   - Release criteria are enforced by default in `run_enemy_regression.py` (maps `E1M1,E1M2,E1M3`, seeds `1,2,3`, tick suites `5000,20000`); use `--quick` only for local iteration.
   - CI release-gate workflow: [`.github/workflows/enemy-regression-gate.yml`](.github/workflows/enemy-regression-gate.yml).
